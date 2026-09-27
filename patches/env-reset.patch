@@ -1,0 +1,75 @@
+Reset the launch environment before anything else runs
+
+Any process running as the user can set the environment of the next GUI
+launch (launchctl setenv). Ghostty trusted it: HOME, XDG_CONFIG_HOME,
+CFFIXED_USER_HOME and GHOSTTY_CONFIG_PATH redirect its config, and
+BASH_ENV runs code in its shells. At the top of main, drop every inherited
+variable except GHOSTTY_MAC_LAUNCH_SOURCE and SSH_AUTH_SOCK, and set HOME,
+USER, LOGNAME and SHELL from the user database, PATH to the system default
+and TMPDIR from confstr. Core Foundation and ProcessInfo read the
+environment on each call (tested on macOS 26), so no re-exec is needed.
+
+--- a/macos/Sources/App/macOS/main.swift
++++ b/macos/Sources/App/macOS/main.swift
+@@ -2,6 +2,61 @@
+ import Cocoa
+ import GhosttyKit
+ 
++// Start from a known environment. Any process running as the user can set
++// the environment of the next GUI launch (launchctl setenv), and inherited
++// variables would redirect Ghostty's config (HOME, XDG_CONFIG_HOME,
++// CFFIXED_USER_HOME, GHOSTTY_CONFIG_PATH) or run code in its shells
++// (BASH_ENV). So every inherited variable is dropped except a short
++// allowlist, and the identity variables come from the user database.
++// Core Foundation and ProcessInfo read the environment on each call, so a
++// reset here, before anything else runs, takes effect for the whole process.
++private func resetLaunchEnvironment() {
++    guard let pw = getpwuid(getuid()),
++          let dir = pw.pointee.pw_dir,
++          let name = pw.pointee.pw_name,
++          let shell = pw.pointee.pw_shell
++    else {
++        fputs("ghostty: cannot read the user database; refusing to start\n", stderr)
++        exit(1)
++    }
++
++    var keep: [String: String] = [
++        "HOME": String(cString: dir),
++        "USER": String(cString: name),
++        "LOGNAME": String(cString: name),
++        "SHELL": String(cString: shell),
++        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
++    ]
++    var tmpdir = [CChar](repeating: 0, count: Int(PATH_MAX))
++    if confstr(_CS_DARWIN_USER_TEMP_DIR, &tmpdir, tmpdir.count) > 0 {
++        keep["TMPDIR"] = String(cString: tmpdir)
++    }
++
++    // Passed through unchanged: the launch source the app bundle sets for
++    // itself (LSEnvironment in Info.plist), and the ssh-agent socket.
++    for key in ["GHOSTTY_MAC_LAUNCH_SOURCE", "SSH_AUTH_SOCK"] {
++        if let value = getenv(key) {
++            keep[key] = String(cString: value)
++        }
++    }
++
++    // Collect the names first: unsetenv changes environ while we walk it.
++    var names: [String] = []
++    var entry = environ
++    while let pair = entry.pointee {
++        names.append(String(String(cString: pair).prefix { $0 != "=" }))
++        entry += 1
++    }
++    for name in names where keep[name] == nil {
++        unsetenv(name)
++    }
++    for (key, value) in keep {
++        setenv(key, value, 1)
++    }
++}
++
++resetLaunchEnvironment()
++
+ // Initialize Ghostty global state. We do this once right away because the
+ // CLI APIs require it and it lets us ensure it is done immediately for the
+ // rest of the app.
