@@ -1,0 +1,14 @@
+# The upstream release this branch builds. One KEY=value per line; the
+# workflow parses these lines strictly and never sources the file.
+#
+# UPSTREAM_BUILD and the Xcode pin come from the official 1.3.1 release
+# (Info.plist CFBundleVersion, DTXcode, DTXcodeBuild), so our build matches
+# its inputs.
+
+UPSTREAM_REPO=https://github.com/ghostty-org/ghostty.git
+UPSTREAM_TAG=v1.3.1
+UPSTREAM_COMMIT=332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28
+UPSTREAM_BUILD=15212
+UPSTREAM_SIGNER=A04D91F3AA0062627A79C9AD523D5DC389D273BC
+XCODE_VERSION=26.2
+XCODE_BUILD=17C52

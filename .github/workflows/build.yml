@@ -1,0 +1,234 @@
+# Build Ghostty.app from the signed upstream tag pinned in UPSTREAM, with the
+# patches listed in patches/series, twice on separate runners, then compare
+# the two bundles file by file. The comparison reports differences and does
+# not fail the run yet: reproducibility is measured, not enforced.
+name: build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build (${{ matrix.run }})
+    runs-on: macos-26
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [a, b]
+    env:
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/local-cache
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/global-cache
+    steps:
+      - name: Check out this branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: hardening
+          persist-credentials: false
+
+      - name: Read pins from UPSTREAM
+        run: |
+          valid() {
+            case "$1" in
+              UPSTREAM_REPO) [[ $2 =~ ^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.git$ ]] ;;
+              UPSTREAM_TAG) [[ $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ;;
+              UPSTREAM_COMMIT) [[ $2 =~ ^[0-9a-f]{40}$ ]] ;;
+              UPSTREAM_BUILD) [[ $2 =~ ^[0-9]+$ ]] ;;
+              UPSTREAM_SIGNER) [[ $2 =~ ^[0-9A-F]{40}$ ]] ;;
+              XCODE_VERSION) [[ $2 =~ ^[0-9]+(\.[0-9]+)+$ ]] ;;
+              XCODE_BUILD) [[ $2 =~ ^[0-9A-Za-z]+$ ]] ;;
+              *) return 1 ;;
+            esac
+          }
+          seen=0
+          while IFS= read -r line || [[ -n $line ]]; do
+            [[ -z $line || $line == \#* ]] && continue
+            key=${line%%=*}
+            value=${line#*=}
+            if ! valid "$key" "$value"; then
+              echo "::error::UPSTREAM: invalid line: $line"
+              exit 1
+            fi
+            echo "$key=$value" >> "$GITHUB_ENV"
+            seen=$((seen + 1))
+          done < hardening/UPSTREAM
+          if [[ $seen -ne 7 ]]; then
+            echo "::error::UPSTREAM: expected 7 keys, found $seen"
+            exit 1
+          fi
+
+      - name: Fetch the upstream tag
+        run: |
+          git init -q src
+          git -C src fetch -q --depth 1 --no-tags "$UPSTREAM_REPO" \
+            "+refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG"
+
+      - name: Verify the tag signature and commit
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          # A public-key import needs no agent; --no-autostart keeps it from
+          # starting one.
+          gpg --batch --quiet --no-autostart --import "hardening/keys/$UPSTREAM_SIGNER.asc"
+          if ! git -C src verify-tag --raw "$UPSTREAM_TAG" 2> "$RUNNER_TEMP/verify.txt"; then
+            cat "$RUNNER_TEMP/verify.txt"
+            echo "::error::tag $UPSTREAM_TAG: signature does not verify"
+            exit 1
+          fi
+          # VALIDSIG's last field is the primary key fingerprint.
+          signer=$(awk '$2 == "VALIDSIG" { print $NF }' "$RUNNER_TEMP/verify.txt")
+          if [[ $signer != "$UPSTREAM_SIGNER" ]]; then
+            echo "::error::tag $UPSTREAM_TAG: signed by '$signer', expected $UPSTREAM_SIGNER"
+            exit 1
+          fi
+          commit=$(git -C src rev-parse "refs/tags/$UPSTREAM_TAG^{commit}")
+          if [[ $commit != "$UPSTREAM_COMMIT" ]]; then
+            echo "::error::tag $UPSTREAM_TAG: points at $commit, expected $UPSTREAM_COMMIT"
+            exit 1
+          fi
+          git -C src checkout -q --detach "$commit"
+          echo "tag $UPSTREAM_TAG -> $commit, signed by $signer"
+
+      - name: Apply patches
+        run: |
+          # Portable to macOS's bash 3.2: no mapfile.
+          count=0
+          while IFS= read -r p || [[ -n $p ]]; do
+            [[ -z ${p//[[:space:]]/} || $p == \#* ]] && continue
+            if [[ $p == */* || $p == .* ]]; then
+              echo "::error::patches/series: invalid entry: $p"
+              exit 1
+            fi
+            echo "applying $p"
+            git -C src apply --index "$GITHUB_WORKSPACE/hardening/patches/$p"
+            count=$((count + 1))
+          done < hardening/patches/series
+          echo "$count patch(es) applied"
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          determinate: true
+
+      - name: Use upstream's binary cache (read-only)
+        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: ghostty
+          skipPush: true
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "/Applications/Xcode_$XCODE_VERSION.app"
+          xcodebuild -version | tee "$RUNNER_TEMP/xcode.txt"
+          if ! grep -qx "Build version $XCODE_BUILD" "$RUNNER_TEMP/xcode.txt"; then
+            echo "::error::expected Xcode build $XCODE_BUILD"
+            exit 1
+          fi
+
+      - name: Build GhosttyKit
+        working-directory: src
+        run: |
+          nix develop -c \
+            zig build \
+            -Doptimize=ReleaseFast \
+            -Demit-macos-app=false \
+            -Dversion-string="${UPSTREAM_TAG#v}"
+
+      # Must run outside Nix: upstream notes that Nix breaks xcodebuild.
+      - name: Build Ghostty.app
+        working-directory: src/macos
+        run: xcodebuild -target Ghostty -configuration Release
+
+      # Same metadata as the upstream release. SUPublicEDKey stays unset, so
+      # Sparkle cannot install an update over this build.
+      - name: Update Info.plist
+        run: |
+          plist=src/macos/build/Release/Ghostty.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :GhosttyCommit ${UPSTREAM_COMMIT:0:9}" "$plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $UPSTREAM_BUILD" "$plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${UPSTREAM_TAG#v}" "$plist"
+          /usr/libexec/PlistBuddy -c "Delete :SUEnableAutomaticChecks" "$plist"
+
+      # Upstream's signing order, with an ad-hoc signature (-s -).
+      - name: Sign ad hoc
+        working-directory: src/macos
+        run: |
+          app=build/Release/Ghostty.app
+          sparkle=$app/Contents/Frameworks/Sparkle.framework
+          for target in \
+            "$sparkle/Versions/B/XPCServices/Downloader.xpc" \
+            "$sparkle/Versions/B/XPCServices/Installer.xpc" \
+            "$sparkle/Versions/B/Autoupdate" \
+            "$sparkle/Versions/B/Updater.app" \
+            "$sparkle" \
+            "$app/Contents/PlugIns/DockTilePlugin.plugin"; do
+            /usr/bin/codesign -f -s - -o runtime "$target"
+          done
+          /usr/bin/codesign -f -s - -o runtime --entitlements Ghostty.entitlements "$app"
+          /usr/bin/codesign --verify --deep --strict "$app"
+
+      - name: Write manifest and archive
+        working-directory: src/macos/build/Release
+        run: |
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          # One line per file: sha256 or "link:<target>", two spaces, path.
+          find Ghostty.app \( -type f -o -type l \) -print0 | LC_ALL=C sort -z |
+            while IFS= read -r -d '' f; do
+              if [[ -L $f ]]; then
+                printf 'link:%s  %s\n' "$(readlink "$f")" "$f"
+              else
+                printf '%s  %s\n' "$(shasum -a 256 < "$f" | cut -d' ' -f1)" "$f"
+              fi
+            done > "$out/manifest.txt"
+          ditto -c -k --keepParent Ghostty.app "$out/Ghostty.app.zip"
+          wc -l < "$out/manifest.txt"
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-${{ matrix.run }}
+          path: ${{ runner.temp }}/out
+          retention-days: 7
+          if-no-files-found: error
+
+  compare:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download both builds
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: build-*
+
+      - name: Compare manifests
+        run: |
+          total=$(wc -l < build-a/manifest.txt)
+          if diff -q build-a/manifest.txt build-b/manifest.txt > /dev/null; then
+            summary="Identical: all $total files match."
+            differing=""
+          else
+            differing=$(diff <(sort -k2 build-a/manifest.txt) <(sort -k2 build-b/manifest.txt) |
+              sed -n 's/^[<>] [^ ]*  //p' | sort -u)
+            count=$(printf '%s\n' "$differing" | grep -c . || true)
+            summary="Not reproducible yet: $count of $total paths differ."
+          fi
+          {
+            echo "## Reproducibility"
+            echo
+            echo "$summary"
+            if [[ -n $differing ]]; then
+              echo
+              echo '```'
+              printf '%s\n' "$differing"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$summary"
