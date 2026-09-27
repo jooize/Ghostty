@@ -146,15 +146,16 @@ jobs:
         working-directory: src/macos
         run: xcodebuild -target Ghostty -configuration Release
 
-      # Same metadata as the upstream release. SUPublicEDKey stays unset, so
-      # Sparkle cannot install an update over this build.
+      # Same version metadata as the upstream release. Unlike upstream, keep
+      # the source's SUEnableAutomaticChecks = false (automatic update checks
+      # off) and leave SUPublicEDKey unset, so Sparkle cannot install an
+      # update over this build.
       - name: Update Info.plist
         run: |
           plist=src/macos/build/Release/Ghostty.app/Contents/Info.plist
           /usr/libexec/PlistBuddy -c "Set :GhosttyCommit ${UPSTREAM_COMMIT:0:9}" "$plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $UPSTREAM_BUILD" "$plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${UPSTREAM_TAG#v}" "$plist"
-          /usr/libexec/PlistBuddy -c "Delete :SUEnableAutomaticChecks" "$plist"
 
       # Upstream's signing order, with an ad-hoc signature (-s -).
       - name: Sign ad hoc
