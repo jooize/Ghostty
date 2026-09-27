@@ -202,7 +202,7 @@ jobs:
 
   compare:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download both builds
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -211,12 +211,13 @@ jobs:
 
       - name: Compare manifests
         run: |
-          total=$(wc -l < build-a/manifest.txt)
+          total=$(( $(wc -l < build-a/manifest.txt) ))
           if diff -q build-a/manifest.txt build-b/manifest.txt > /dev/null; then
             summary="Identical: all $total files match."
             differing=""
           else
-            differing=$(diff <(sort -k2 build-a/manifest.txt) <(sort -k2 build-b/manifest.txt) |
+            # diff exits 1 when the inputs differ; that is the expected case here.
+            differing=$({ diff <(sort -k2 build-a/manifest.txt) <(sort -k2 build-b/manifest.txt) || true; } |
               sed -n 's/^[<>] [^ ]*  //p' | sort -u)
             count=$(printf '%s\n' "$differing" | grep -c . || true)
             summary="Not reproducible yet: $count of $total paths differ."
