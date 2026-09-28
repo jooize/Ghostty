@@ -2,3 +2,4 @@
 # (relative to this directory). Blank lines and lines starting with # are
 # ignored.
 env-reset.patch
+system-config.patch

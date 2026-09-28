@@ -1,0 +1,1099 @@
+Load a protected system configuration file first
+
+Ghostty's configuration comes from files the user can write, from the
+command line, and on macOS from GHOSTTY_CONFIG_PATH. Any process running as
+the user can change all of those, and a configuration can set the command
+Ghostty runs. An administrator has no place for settings that the user's own
+processes cannot override.
+
+Load /etc/ghostty/config.ghostty (/private/etc on macOS) before anything
+else, but only if nobody but root can change it. The path is resolved one
+component at a time relative to checked, open directories: every entry must
+be owned by root, every directory unwritable by group and others unless it
+is sticky (such as /nix/store, which nix-darwin's /etc links point into),
+the file unwritable by group and others, and on macOS no ACL may allow
+changes. A missing file changes nothing, so Ghostty behaves as upstream.
+
+Two settings are honored only in that file, captured right after it loads
+so nothing later can change them:
+
+  * config-default-files = false skips the user's configuration files, a
+    file named by GHOSTTY_CONFIG_PATH, and theme lookup in the user's theme
+    directory (themes are configuration files too).
+  * config-cli-args = false (new) ignores configuration from command-line
+    arguments, which any process can pass with `open --args`.
+
+A system file that fails the check, or cannot be read, is not loaded, and
+Ghostty skips user files and command-line configuration too, since the file
+may have meant to turn them off. It runs with the built-in defaults and
+reports why in the configuration-errors window and the log. A build option,
+-Dsystem-config=required, treats a missing file the same way.
+
+The macOS app loads the system file itself before choosing between the
+default files and GHOSTTY_CONFIG_PATH (new C API
+ghostty_config_load_system_file), so this patch does not rely on
+env-reset.patch.
+
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1041,6 +1041,7 @@
+ ghostty_config_t ghostty_config_new();
+ void ghostty_config_free(ghostty_config_t);
+ ghostty_config_t ghostty_config_clone(ghostty_config_t);
++bool ghostty_config_load_system_file(ghostty_config_t);
+ void ghostty_config_load_cli_args(ghostty_config_t);
+ void ghostty_config_load_file(ghostty_config_t, const char*);
+ void ghostty_config_load_default_files(ghostty_config_t);
+--- a/macos/Sources/Ghostty/Ghostty.Config.swift
++++ b/macos/Sources/Ghostty/Ghostty.Config.swift
+@@ -64,8 +64,15 @@
+             // We only do this on macOS because other Apple platforms do not have the
+             // same filesystem concept.
+ #if os(macOS)
++            // The system configuration file comes first, and it can turn user
++            // files off, including a file named by GHOSTTY_CONFIG_PATH.
++            let userFiles = ghostty_config_load_system_file(cfg)
+             if let path {
+-                ghostty_config_load_file(cfg, path)
++                if userFiles {
++                    ghostty_config_load_file(cfg, path)
++                } else {
++                    logger.warning("the system configuration turned off user files; not loading \(path)")
++                }
+             } else {
+                 ghostty_config_load_default_files(cfg)
+             }
+--- a/src/build/Config.zig
++++ b/src/build/Config.zig
+@@ -34,6 +34,7 @@
+ simd: bool = true,
+ i18n: bool = true,
+ wasm_shared: bool = true,
++system_config: SystemConfig = .optional,
+ 
+ /// Ghostty exe properties
+ exe_entrypoint: ExeEntrypoint = .ghostty,
+@@ -203,6 +204,12 @@
+         else => false,
+     };
+ 
++    config.system_config = b.option(
++        SystemConfig,
++        "system-config",
++        "Whether the system configuration file /etc/ghostty/config.ghostty must exist. With \"required\", a missing file is handled like one that fails its ownership check: Ghostty uses the built-in defaults. Default is \"optional\".",
++    ) orelse .optional;
++
+     //---------------------------------------------------------------
+     // Ghostty Exe Properties
+ 
+@@ -486,6 +493,7 @@
+     step.addOption(ExeEntrypoint, "exe_entrypoint", self.exe_entrypoint);
+     step.addOption(WasmTarget, "wasm_target", self.wasm_target);
+     step.addOption(bool, "wasm_shared", self.wasm_shared);
++    step.addOption(SystemConfig, "system_config", self.system_config);
+ 
+     // Our version. We also add the string version so we don't need
+     // to do any allocations at runtime. This has to be long enough to
+@@ -624,6 +632,16 @@
+     webgen_config,
+     webgen_actions,
+     webgen_commands,
++};
++
++/// Whether the system configuration file must exist. See `config-default-files`
++/// in src/config/Config.zig.
++pub const SystemConfig = enum {
++    /// A missing file means no system configuration, as in upstream Ghostty.
++    optional,
++
++    /// A missing file is handled like one that fails its ownership check.
++    required,
+ };
+ 
+ /// The release channel for the build.
+--- a/src/build_config.zig
++++ b/src/build_config.zig
+@@ -20,6 +20,9 @@
+ /// The release channel for this build.
+ pub const release_channel = std.meta.stringToEnum(ReleaseChannel, @tagName(options.release_channel)).?;
+ 
++/// Whether the system configuration file must exist.
++pub const system_config = std.meta.stringToEnum(BuildConfig.SystemConfig, @tagName(options.system_config)).?;
++
+ /// The optimization mode as a string.
+ pub const mode_string = mode: {
+     const m = @tagName(builtin.mode);
+--- a/src/config/CApi.zig
++++ b/src/config/CApi.zig
+@@ -56,6 +56,17 @@
+     };
+ }
+ 
++/// Load the system configuration file (see `config-default-files`). The
++/// other loaders do this themselves; call it directly before loading a user
++/// file with ghostty_config_load_file. Returns whether user configuration
++/// files may be loaded. If loading fails, user files are refused.
++export fn ghostty_config_load_system_file(self: *Config) bool {
++    return self.loadSystemFile(state.alloc) catch |err| {
++        log.err("error loading the system config err={}", .{err});
++        return false;
++    };
++}
++
+ /// Load the configuration from the default file locations. This
+ /// is usually done first. The default file locations are locations
+ /// such as the home directory.
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -26,6 +26,7 @@
+ const conditional = @import("conditional.zig");
+ const Conditional = conditional.Conditional;
+ const file_load = @import("file_load.zig");
++const system_file = @import("system_file.zig");
+ const formatterpkg = @import("formatter.zig");
+ const themepkg = @import("theme.zig");
+ const url = @import("url.zig");
+@@ -2459,10 +2460,36 @@
+ /// This is targeted directly at using Ghostty from the CLI in a way
+ /// that minimizes external effects.
+ ///
+-/// This is a CLI-only configuration. Setting this in a configuration file
+-/// will have no effect. It is not an error, but it will not do anything.
+-/// This configuration can only be set via CLI arguments.
++/// This can be set via CLI arguments or in the system configuration file
++/// (see below). Setting this in any other configuration file will have no
++/// effect. It is not an error, but it will not do anything.
++///
++/// The system configuration file is `/etc/ghostty/config.ghostty`. When it
++/// exists, Ghostty loads it before any other configuration, but only if
++/// nobody but root can change it: the file and every directory on the way to
++/// it must be owned by root and not writable by group or others (a sticky
++/// directory such as `/nix/store` may be writable), and on macOS no access
++/// control list may allow changes. If the check fails, Ghostty ignores the
++/// system file, all user configuration files and command-line configuration,
++/// runs with the built-in defaults, and reports why as a configuration error.
++/// A build made with `-Dsystem-config=required` treats a missing system file
++/// the same way.
++///
++/// Setting `config-default-files = false` in the system file stops Ghostty
++/// from loading the default configuration files, including a file named by
++/// `GHOSTTY_CONFIG_PATH` on macOS. Theme names are then only looked up in
++/// Ghostty's resources directory, since themes are configuration files too.
++/// The system file can still name files to load with `config-file`.
+ @"config-default-files": bool = true,
++
++/// When this is false, configuration from command-line arguments is ignored,
++/// including `-e`. On macOS, command-line arguments reach the app through
++/// `open --args`, so any process can start Ghostty with a configuration of
++/// its choice before you open it yourself.
++///
++/// This is only honored in the system configuration file (see
++/// `config-default-files`). Setting it anywhere else has no effect.
++@"config-cli-args": bool = true,
+ 
+ /// Confirms that a surface should be closed before closing it.
+ ///
+@@ -3785,6 +3812,9 @@
+ /// as loadTheme which has more details on why.
+ _replay_steps: std.ArrayListUnmanaged(Replay.Step) = .{},
+ 
++/// What the system configuration file decided. See loadSystemFile.
++_system: System = .{},
++
+ /// Set to true if Ghostty was executed as xdg-terminal-exec on Linux.
+ @"_xdg-terminal-exec": bool = false,
+ 
+@@ -3980,9 +4010,245 @@
+     try writer.print(
+         @embedFile("./config-template"),
+         .{ .path = path },
++    );
++}
++
++/// What the system configuration file decided. It is kept apart from the
++/// public fields so that nothing loaded after the system file can change it.
++const System = struct {
++    /// True once loadSystemFile has run; it only runs once per config.
++    loaded: bool = false,
++
++    /// Whether user configuration files may be loaded: the default files,
++    /// a file named by GHOSTTY_CONFIG_PATH on macOS, and user themes.
++    default_files: bool = true,
++
++    /// Whether command-line configuration may be loaded.
++    cli_args: bool = true,
++
++    /// The replay steps the system file recorded. These are only valid
++    /// until finalize, which rebuilds the replay steps for themes.
++    replay_start: usize = 0,
++    replay_end: usize = 0,
++};
++
++/// Load the system configuration file, if it exists and nobody but root can
++/// change it. See `config-default-files` for the rules. This runs before any
++/// other configuration is loaded; loadDefaultFiles and loadCliArgs call it
++/// themselves, and later calls do nothing.
++///
++/// Returns whether user configuration files may be loaded, for callers that
++/// load a user file directly (the macOS app with GHOSTTY_CONFIG_PATH).
++pub fn loadSystemFile(self: *Config, alloc_gpa: Allocator) !bool {
++    try self.loadSystemFileAt(alloc_gpa, system_file.path, null);
++    return self._system.default_files;
++}
++
++/// loadSystemFile with the path and an extra trusted owner as parameters,
++/// so tests can use a temporary directory.
++fn loadSystemFileAt(
++    self: *Config,
++    alloc_gpa: Allocator,
++    path: []const u8,
++    trusted_uid: ?std.posix.uid_t,
++) !void {
++    if (self._system.loaded) return;
++    self._system.loaded = true;
++
++    // Refuse user files until the system file is known to be absent or has
++    // loaded, so that an error on the way fails closed.
++    self._system.default_files = false;
++    self._system.cli_args = false;
++
++    const arena_alloc = self._arena.?.allocator();
++    var file = switch (try system_file.open(arena_alloc, path, trusted_uid)) {
++        .file => |file| file,
++        .absent => switch (build_config.system_config) {
++            .optional => {
++                self._system.default_files = true;
++                self._system.cli_args = true;
++                return;
++            },
++            .required => return try self.rejectSystemFile(path, try std.fmt.allocPrint(
++                arena_alloc,
++                "{s}: does not exist, and this build of Ghostty requires it",
++                .{path},
++            )),
++        },
++        .rejected => |reason| return try self.rejectSystemFile(path, reason),
++    };
++    defer file.close();
++
++    self._system.replay_start = self._replay_steps.items.len;
++    self.loadFsFile(alloc_gpa, &file, path) catch |err| switch (err) {
++        error.OutOfMemory => return error.OutOfMemory,
++        else => return try self.rejectSystemFile(path, try std.fmt.allocPrint(
++            arena_alloc,
++            "{s}: cannot read it: {t}",
++            .{ path, err },
++        )),
++    };
++    self._system.replay_end = self._replay_steps.items.len;
++
++    // Capture the settings only the system file may make, then put the
++    // public fields back so a later value has nothing to change.
++    self._system.default_files = self.@"config-default-files";
++    self._system.cli_args = self.@"config-cli-args";
++    self.@"config-default-files" = true;
++    self.@"config-cli-args" = true;
++}
++
++/// Fall back to the built-in defaults and say why. A system file that
++/// cannot be trusted might have been meant to turn user files off, so user
++/// files and command-line configuration are skipped too.
++fn rejectSystemFile(self: *Config, path: []const u8, reason: []const u8) !void {
++    self._system.default_files = false;
++    self._system.cli_args = false;
++
++    const arena_alloc = self._arena.?.allocator();
++    const diag: cli.Diagnostic = .{
++        .message = try std.fmt.allocPrintSentinel(
++            arena_alloc,
++            "not loading the system configuration file {s} ({s}); " ++
++                "using the built-in defaults and ignoring user configuration " ++
++                "files and command-line configuration",
++            .{ path, reason },
++            0,
++        ),
++    };
++    log.warn("{s}", .{diag.message});
++    try self._diagnostics.append(arena_alloc, diag);
++    try self._replay_steps.append(arena_alloc, .{ .diagnostic = diag });
++}
++
++test {
++    _ = system_file;
++}
++
++/// Write a system configuration file into a temporary directory for the
++/// tests below and return its path. The directory is owned by the test
++/// user, who is passed to loadSystemFileAt as a trusted owner.
++fn testSystemFile(
++    tmp: *std.testing.TmpDir,
++    data: []const u8,
++    mode: std.fs.File.Mode,
++) ![]const u8 {
++    const alloc = std.testing.allocator;
++    try tmp.dir.chmod(0o755);
++    const file = try tmp.dir.createFile("config.ghostty", .{});
++    defer file.close();
++    try file.writeAll(data);
++    try file.chmod(mode);
++    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
++    defer alloc.free(dir_path);
++    return try std.fs.path.join(alloc, &.{ dir_path, "config.ghostty" });
++}
++
++test "system config: settings only the system file may make" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const path = try testSystemFile(&tmp,
++        \\font-size = 20
++        \\config-default-files = false
++        \\config-cli-args = false
++        \\
++    , 0o644);
++    defer alloc.free(path);
++
++    var cfg = try Config.default(alloc);
++    defer cfg.deinit();
++    try cfg.loadSystemFileAt(alloc, path, std.posix.getuid());
++
++    try testing.expect(cfg._diagnostics.empty());
++    try testing.expectEqual(20, cfg.@"font-size");
++    try testing.expect(!cfg._system.default_files);
++    try testing.expect(!cfg._system.cli_args);
++    try testing.expect(cfg.@"config-default-files");
++    try testing.expect(cfg.@"config-cli-args");
++
++    // Later calls keep the first result, and the loaders respect it.
++    try testing.expect(!try cfg.loadSystemFile(alloc));
++    try cfg.loadDefaultFiles(alloc);
++    try cfg.loadCliArgs(alloc);
++    try testing.expect(cfg._diagnostics.empty());
++    try testing.expectEqual(20, cfg.@"font-size");
++}
++
++test "system config: the same settings in another file have no effect" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const path = try testSystemFile(&tmp, "font-size = 20\n", 0o644);
++    defer alloc.free(path);
++
++    var cfg = try Config.default(alloc);
++    defer cfg.deinit();
++    try cfg.loadSystemFileAt(alloc, path, std.posix.getuid());
++
++    var reader: std.Io.Reader = .fixed(
++        \\config-default-files = false
++        \\config-cli-args = false
++        \\
+     );
++    try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
++    try testing.expect(cfg._system.default_files);
++    try testing.expect(cfg._system.cli_args);
+ }
+ 
++test "system config: a file that fails the check falls back to the defaults" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const path = try testSystemFile(&tmp, "font-size = 20\n", 0o666);
++    defer alloc.free(path);
++
++    var cfg = try Config.default(alloc);
++    defer cfg.deinit();
++    try cfg.loadSystemFileAt(alloc, path, std.posix.getuid());
++
++    var defaults = try Config.default(alloc);
++    defer defaults.deinit();
++    try testing.expectEqual(defaults.@"font-size", cfg.@"font-size");
++    try testing.expect(!cfg._system.default_files);
++    try testing.expect(!cfg._system.cli_args);
++    try testing.expectEqual(1, cfg._diagnostics.items().len);
++    const message = cfg._diagnostics.items()[0].message;
++    try testing.expect(std.mem.indexOf(u8, message, "writable by others") != null);
++}
++
++test "system config: a missing file changes nothing unless the build requires it" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.chmod(0o755);
++    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
++    defer alloc.free(dir_path);
++    const path = try std.fs.path.join(alloc, &.{ dir_path, "config.ghostty" });
++    defer alloc.free(path);
++
++    var cfg = try Config.default(alloc);
++    defer cfg.deinit();
++    try cfg.loadSystemFileAt(alloc, path, std.posix.getuid());
++
++    switch (build_config.system_config) {
++        .optional => {
++            try testing.expect(cfg._diagnostics.empty());
++            try testing.expect(cfg._system.default_files);
++            try testing.expect(cfg._system.cli_args);
++        },
++        .required => {
++            try testing.expectEqual(1, cfg._diagnostics.items().len);
++            try testing.expect(!cfg._system.default_files);
++            try testing.expect(!cfg._system.cli_args);
++        },
++    }
++}
++
+ /// Load configurations from the default configuration files. The default
+ /// configuration file is at `$XDG_CONFIG_HOME/ghostty/config.ghostty`.
+ ///
+@@ -3991,7 +4257,15 @@
+ ///
+ /// The legacy `config` file (without extension) is first loaded,
+ /// then `config.ghostty`.
++///
++/// The system configuration file is loaded before these, and can turn
++/// them off. See loadSystemFile.
+ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
++    if (!try self.loadSystemFile(alloc)) {
++        log.info("the system configuration turned off user configuration files", .{});
++        return;
++    }
++
+     // Load XDG first
+     const legacy_xdg_path = try file_load.legacyDefaultXdgPath(alloc);
+     defer alloc.free(legacy_xdg_path);
+@@ -4065,6 +4339,12 @@
+ 
+ /// Load and parse the CLI args.
+ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
++    _ = try self.loadSystemFile(alloc_gpa);
++    if (!self._system.cli_args) {
++        log.info("the system configuration turned off command-line configuration", .{});
++        return;
++    }
++
+     switch (builtin.os.tag) {
+         .windows => {},
+ 
+@@ -4152,6 +4432,18 @@
+ 
+         var new_config = try self.cloneEmpty(alloc_gpa);
+         errdefer new_config.deinit();
++
++        // The system file is not a default file: keep it.
++        var system_it = Replay.iterator(
++            self._replay_steps.items[self._system.replay_start..self._system.replay_end],
++            &new_config,
++        );
++        try new_config.loadIter(alloc_gpa, &system_it);
++        new_config._system.replay_start = 0;
++        new_config._system.replay_end = new_config._replay_steps.items.len;
++        new_config.@"config-default-files" = true;
++        new_config.@"config-cli-args" = true;
++
+         var it = Replay.iterator(
+             self._replay_steps.items[replay_len_start..replay_len_end],
+             &new_config,
+@@ -4387,6 +4679,7 @@
+         self._arena.?.allocator(),
+         name,
+         &self._diagnostics,
++        self._system.default_files,
+     )) orelse return;
+     const path = themefile.path;
+     const file = themefile.file;
+@@ -4888,6 +5181,7 @@
+ ) Allocator.Error!Config {
+     var result = try default(alloc_gpa);
+     result._conditional_state = self._conditional_state;
++    result._system = self._system;
+     return result;
+ }
+ 
+--- /dev/null
++++ b/src/config/system_file.zig
+@@ -0,0 +1,534 @@
++//! The system configuration file: a configuration file that an
++//! administrator owns and Ghostty loads before any user file. It can also
++//! turn user files and command-line configuration off (see
++//! `config-default-files` and `config-cli-args`), so it is only trusted
++//! when nobody but root can change it.
++const std = @import("std");
++const builtin = @import("builtin");
++const assert = std.debug.assert;
++const Allocator = std.mem.Allocator;
++const posix = std.posix;
++
++/// The location of the system configuration file. It is fixed at build time
++/// and never read from the environment, because any process running as the
++/// user can set the environment of the next launch. On macOS, /etc is a
++/// symlink to /private/etc, so the real directory is named directly.
++pub const path = if (builtin.os.tag.isDarwin())
++    "/private/etc/ghostty/config.ghostty"
++else
++    "/etc/ghostty/config.ghostty";
++
++pub const Result = union(enum) {
++    /// The file does not exist. Every directory on the way to it passed
++    /// the checks, so only root could have removed it.
++    absent,
++
++    /// The file passed every check. The caller owns it and must close it.
++    file: std.fs.File,
++
++    /// The file exists but cannot be trusted. The message says why and is
++    /// meant for the user. It is allocated with the allocator passed to
++    /// `open`.
++    rejected: [:0]const u8,
++};
++
++/// Open the system configuration file at `abs_path` if nobody but root can
++/// change it. `trusted_uid` names one more trusted owner besides root; only
++/// tests set it.
++///
++/// The path is resolved one component at a time relative to directory
++/// handles that are already open and checked, so nothing on the way can be
++/// swapped between a check and its use. The rules:
++///
++///   * Every entry on the way, including each symlink and each symlink
++///     target, is owned by a trusted user.
++///   * Every directory is unwritable by its group and by others, unless it
++///     is sticky (such as /nix/store), where only an entry's owner can
++///     rename or remove the entry.
++///   * The file is a regular file that its group and others cannot write.
++///   * On macOS, no access control list on a directory or on the file allows
++///     anyone to write, delete or change permissions. POSIX ACLs on other
++///     systems are covered by the mode check, since the group bits hold
++///     the ACL mask.
++pub fn open(
++    alloc: Allocator,
++    abs_path: []const u8,
++    trusted_uid: ?posix.uid_t,
++) Allocator.Error!Result {
++    assert(std.fs.path.isAbsolute(abs_path));
++
++    var walk: Walk = .{
++        .arena = .init(alloc),
++        .trusted_uid = trusted_uid,
++    };
++    defer walk.deinit();
++
++    return walk.run(abs_path) catch |err| switch (err) {
++        error.OutOfMemory => return error.OutOfMemory,
++        error.Rejected => .{ .rejected = try alloc.dupeZ(u8, walk.reason) },
++    };
++}
++
++/// Symlinks followed before the path counts as a loop, as in most kernels.
++const max_symlinks = 32;
++
++const Error = Allocator.Error || error{Rejected};
++
++const Walk = struct {
++    arena: std.heap.ArenaAllocator,
++    trusted_uid: ?posix.uid_t,
++
++    /// The directories entered so far, from the root down to the current
++    /// one. Each is open and has passed `checkDir`.
++    dirs: std.ArrayListUnmanaged(Dir) = .empty,
++
++    /// Path components still to resolve, the next one last.
++    pending: std.ArrayListUnmanaged([]const u8) = .empty,
++
++    symlinks: usize = 0,
++    reason: []const u8 = "",
++
++    const Dir = struct {
++        fd: posix.fd_t,
++        path: []const u8,
++    };
++
++    fn deinit(self: *Walk) void {
++        for (self.dirs.items) |dir| posix.close(dir.fd);
++        self.arena.deinit();
++    }
++
++    fn run(self: *Walk, abs_path: []const u8) Error!Result {
++        try self.enterRoot();
++        try self.push(abs_path);
++
++        while (self.pending.pop()) |name| {
++            if (std.mem.eql(u8, name, "..")) {
++                self.leave();
++                continue;
++            }
++
++            const dir = self.dirs.getLast();
++            const entry_path = try std.fs.path.join(
++                self.arena.allocator(),
++                &.{ dir.path, name },
++            );
++            const st = posix.fstatat(
++                dir.fd,
++                name,
++                posix.AT.SYMLINK_NOFOLLOW,
++            ) catch |err| switch (err) {
++                // The directory holding the entry passed the checks, so the
++                // absence is as trustworthy as the file would be.
++                error.FileNotFound => return .absent,
++                else => return self.reject("{s}: cannot inspect it: {t}", .{ entry_path, err }),
++            };
++            try self.checkOwner(entry_path, st);
++
++            const last = self.pending.items.len == 0;
++            if (posix.S.ISLNK(st.mode)) {
++                try self.follow(dir.fd, name, entry_path);
++            } else if (posix.S.ISDIR(st.mode)) {
++                if (last) return self.reject("{s}: is a directory", .{entry_path});
++                try self.enter(dir.fd, name, entry_path, st);
++            } else if (posix.S.ISREG(st.mode)) {
++                if (!last) return self.reject("{s}: is not a directory", .{entry_path});
++                return .{ .file = try self.openFile(dir.fd, name, entry_path, st) };
++            } else {
++                return self.reject("{s}: is not a regular file", .{entry_path});
++            }
++        }
++
++        // The path named a directory, for example "/" or "/etc/..".
++        return self.reject("{s}: is a directory", .{self.dirs.getLast().path});
++    }
++
++    /// Queue the components of `p` so that the first one is resolved next.
++    fn push(self: *Walk, p: []const u8) Allocator.Error!void {
++        const alloc = self.arena.allocator();
++        const start = self.pending.items.len;
++        var it = std.mem.tokenizeScalar(u8, p, '/');
++        while (it.next()) |name| {
++            if (std.mem.eql(u8, name, ".")) continue;
++            try self.pending.append(alloc, name);
++        }
++        std.mem.reverse([]const u8, self.pending.items[start..]);
++    }
++
++    fn enterRoot(self: *Walk) Error!void {
++        const fd = posix.open("/", .{
++            .DIRECTORY = true,
++            .CLOEXEC = true,
++        }, 0) catch |err| return self.reject("/: cannot open it: {t}", .{err});
++        errdefer posix.close(fd);
++        const st = posix.fstat(fd) catch |err|
++            return self.reject("/: cannot inspect it: {t}", .{err});
++        try self.checkOwner("/", st);
++        try self.checkDir("/", fd, st);
++        try self.dirs.append(self.arena.allocator(), .{ .fd = fd, .path = "/" });
++    }
++
++    fn enter(
++        self: *Walk,
++        parent: posix.fd_t,
++        name: []const u8,
++        entry_path: []const u8,
++        lst: posix.Stat,
++    ) Error!void {
++        const fd = posix.openat(parent, name, .{
++            .DIRECTORY = true,
++            .NOFOLLOW = true,
++            .CLOEXEC = true,
++        }, 0) catch |err| return self.reject("{s}: cannot open it: {t}", .{ entry_path, err });
++        errdefer posix.close(fd);
++        const st = try self.statSame(fd, entry_path, lst);
++        try self.checkDir(entry_path, fd, st);
++        try self.dirs.append(self.arena.allocator(), .{ .fd = fd, .path = entry_path });
++    }
++
++    fn leave(self: *Walk) void {
++        // ".." at the root stays at the root, as the kernel does.
++        if (self.dirs.items.len > 1) posix.close(self.dirs.pop().?.fd);
++    }
++
++    fn follow(
++        self: *Walk,
++        parent: posix.fd_t,
++        name: []const u8,
++        entry_path: []const u8,
++    ) Error!void {
++        self.symlinks += 1;
++        if (self.symlinks > max_symlinks) {
++            return self.reject("{s}: too many levels of symbolic links", .{entry_path});
++        }
++
++        const buf = try self.arena.allocator().alloc(u8, std.fs.max_path_bytes);
++        const target = posix.readlinkat(parent, name, buf) catch |err|
++            return self.reject("{s}: cannot read the symbolic link: {t}", .{ entry_path, err });
++
++        // An absolute target starts again from the root, which stays open.
++        if (std.fs.path.isAbsolute(target)) {
++            while (self.dirs.items.len > 1) posix.close(self.dirs.pop().?.fd);
++        }
++        try self.push(target);
++    }
++
++    fn openFile(
++        self: *Walk,
++        parent: posix.fd_t,
++        name: []const u8,
++        entry_path: []const u8,
++        lst: posix.Stat,
++    ) Error!std.fs.File {
++        const fd = posix.openat(parent, name, .{
++            .NOFOLLOW = true,
++            .CLOEXEC = true,
++        }, 0) catch |err| return self.reject("{s}: cannot open it: {t}", .{ entry_path, err });
++        errdefer posix.close(fd);
++        const st = try self.statSame(fd, entry_path, lst);
++        if (st.mode & posix.S.IWGRP != 0) {
++            return self.reject("{s}: writable by its group", .{entry_path});
++        }
++        if (st.mode & posix.S.IWOTH != 0) {
++            return self.reject("{s}: writable by others", .{entry_path});
++        }
++        try self.checkAcl(entry_path, fd);
++        return .{ .handle = fd };
++    }
++
++    /// Stat an entry just opened and make sure it is the one that was
++    /// checked by name before opening it.
++    fn statSame(
++        self: *Walk,
++        fd: posix.fd_t,
++        entry_path: []const u8,
++        lst: posix.Stat,
++    ) Error!posix.Stat {
++        const st = posix.fstat(fd) catch |err|
++            return self.reject("{s}: cannot inspect it: {t}", .{ entry_path, err });
++        if (st.dev != lst.dev or st.ino != lst.ino) {
++            return self.reject("{s}: changed while it was being checked", .{entry_path});
++        }
++        return st;
++    }
++
++    fn checkOwner(self: *Walk, entry_path: []const u8, st: posix.Stat) Error!void {
++        if (st.uid == 0) return;
++        if (self.trusted_uid) |uid| if (st.uid == uid) return;
++        return self.reject("{s}: owned by uid {d}, not root", .{ entry_path, st.uid });
++    }
++
++    fn checkDir(
++        self: *Walk,
++        dir_path: []const u8,
++        fd: posix.fd_t,
++        st: posix.Stat,
++    ) Error!void {
++        // In a sticky directory only an entry's owner can rename or remove
++        // it, and every entry on the way is checked for a trusted owner.
++        if (st.mode & posix.S.ISVTX == 0) {
++            if (st.mode & posix.S.IWGRP != 0) {
++                return self.reject("{s}: writable by its group", .{dir_path});
++            }
++            if (st.mode & posix.S.IWOTH != 0) {
++                return self.reject("{s}: writable by others", .{dir_path});
++            }
++        }
++        try self.checkAcl(dir_path, fd);
++    }
++
++    fn checkAcl(self: *Walk, entry_path: []const u8, fd: posix.fd_t) Error!void {
++        if (comptime !builtin.os.tag.isDarwin()) return;
++
++        const acl = darwin_acl.acl_get_fd_np(fd, darwin_acl.ACL_TYPE_EXTENDED) orelse {
++            if (std.c._errno().* == @intFromEnum(posix.E.NOENT)) return;
++            return self.reject("{s}: cannot read its access control list", .{entry_path});
++        };
++        defer _ = darwin_acl.acl_free(acl);
++
++        var entry: ?*anyopaque = null;
++        var id: c_int = darwin_acl.ACL_FIRST_ENTRY;
++        while (darwin_acl.acl_get_entry(acl, id, &entry) == 0) : (id = darwin_acl.ACL_NEXT_ENTRY) {
++            var tag: c_int = undefined;
++            var permset: ?*anyopaque = null;
++            if (darwin_acl.acl_get_tag_type(entry, &tag) != 0 or
++                darwin_acl.acl_get_permset(entry, &permset) != 0)
++            {
++                return self.reject("{s}: cannot read its access control list", .{entry_path});
++            }
++            if (tag != darwin_acl.ACL_EXTENDED_ALLOW) continue;
++            for (darwin_acl.write_perms) |perm| {
++                if (darwin_acl.acl_get_perm_np(permset, perm) == 1) {
++                    return self.reject("{s}: an access control list allows changes", .{entry_path});
++                }
++            }
++        }
++    }
++
++    fn reject(self: *Walk, comptime fmt: []const u8, args: anytype) Error {
++        self.reason = try std.fmt.allocPrint(self.arena.allocator(), fmt, args);
++        return error.Rejected;
++    }
++};
++
++/// The part of <sys/acl.h> used here; the values are from the macOS SDK.
++const darwin_acl = struct {
++    const ACL_TYPE_EXTENDED: c_int = 0x00000100;
++    const ACL_FIRST_ENTRY: c_int = 0;
++    const ACL_NEXT_ENTRY: c_int = -1;
++    const ACL_EXTENDED_ALLOW: c_int = 1;
++
++    /// Permissions that let someone change an entry or what it contains.
++    const write_perms = [_]c_int{
++        1 << 2, // ACL_WRITE_DATA, ACL_ADD_FILE
++        1 << 4, // ACL_DELETE
++        1 << 5, // ACL_APPEND_DATA, ACL_ADD_SUBDIRECTORY
++        1 << 6, // ACL_DELETE_CHILD
++        1 << 8, // ACL_WRITE_ATTRIBUTES
++        1 << 10, // ACL_WRITE_EXTATTRIBUTES
++        1 << 12, // ACL_WRITE_SECURITY
++        1 << 13, // ACL_CHANGE_OWNER
++    };
++
++    extern "c" fn acl_get_fd_np(fd: c_int, ty: c_int) ?*anyopaque;
++    extern "c" fn acl_free(obj: *anyopaque) c_int;
++    extern "c" fn acl_get_entry(acl: *anyopaque, entry_id: c_int, entry: *?*anyopaque) c_int;
++    extern "c" fn acl_get_tag_type(entry: ?*anyopaque, tag: *c_int) c_int;
++    extern "c" fn acl_get_permset(entry: ?*anyopaque, permset: *?*anyopaque) c_int;
++    extern "c" fn acl_get_perm_np(permset: ?*anyopaque, perm: c_int) c_int;
++};
++
++// The tests run in a temporary directory owned by the test user, so they
++// pass that user as `trusted_uid`. They assume that no directory above it is
++// writable by its group or others (true for a home directory or a CI
++// workspace with the usual umask).
++
++const TestDir = struct {
++    tmp: std.testing.TmpDir,
++    path: []const u8,
++
++    fn init() !TestDir {
++        var tmp = std.testing.tmpDir(.{});
++        errdefer tmp.cleanup();
++        try tmp.dir.chmod(0o755);
++        const p = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
++        return .{ .tmp = tmp, .path = p };
++    }
++
++    fn deinit(self: *TestDir) void {
++        std.testing.allocator.free(self.path);
++        self.tmp.cleanup();
++    }
++
++    fn join(self: *const TestDir, sub: []const u8) ![]const u8 {
++        return std.fs.path.join(std.testing.allocator, &.{ self.path, sub });
++    }
++
++    fn writeFile(self: *const TestDir, sub: []const u8, mode: std.fs.File.Mode) !void {
++        const file = try self.tmp.dir.createFile(sub, .{});
++        defer file.close();
++        try file.writeAll("font-size = 20\n");
++        try file.chmod(mode);
++    }
++
++    fn check(self: *const TestDir, sub: []const u8) !Result {
++        const p = try self.join(sub);
++        defer std.testing.allocator.free(p);
++        return try open(std.testing.allocator, p, posix.getuid());
++    }
++};
++
++fn expectFile(result: Result) !void {
++    switch (result) {
++        .file => |f| f.close(),
++        .absent => return error.TestExpectedFile,
++        .rejected => |msg| {
++            defer std.testing.allocator.free(msg);
++            std.debug.print("unexpected rejection: {s}\n", .{msg});
++            return error.TestExpectedFile;
++        },
++    }
++}
++
++fn expectAbsent(result: Result) !void {
++    switch (result) {
++        .absent => {},
++        .file => |f| {
++            f.close();
++            return error.TestExpectedAbsent;
++        },
++        .rejected => |msg| {
++            defer std.testing.allocator.free(msg);
++            std.debug.print("unexpected rejection: {s}\n", .{msg});
++            return error.TestExpectedAbsent;
++        },
++    }
++}
++
++fn expectRejected(result: Result, needle: []const u8) !void {
++    switch (result) {
++        .file => |f| {
++            f.close();
++            return error.TestExpectedRejection;
++        },
++        .absent => return error.TestExpectedRejection,
++        .rejected => |msg| {
++            defer std.testing.allocator.free(msg);
++            if (std.mem.indexOf(u8, msg, needle) == null) {
++                std.debug.print("rejection without \"{s}\": {s}\n", .{ needle, msg });
++                return error.TestUnexpectedMessage;
++            }
++        },
++    }
++}
++
++test "system file: a protected regular file opens" {
++    var t = try TestDir.init();
++    defer t.deinit();
++    try t.writeFile("config.ghostty", 0o644);
++    try expectFile(try t.check("config.ghostty"));
++}
++
++test "system file: a missing file or directory is absent" {
++    var t = try TestDir.init();
++    defer t.deinit();
++    try expectAbsent(try t.check("config.ghostty"));
++    try expectAbsent(try t.check("missing/config.ghostty"));
++}
++
++test "system file: a file writable by its group or others is rejected" {
++    var t = try TestDir.init();
++    defer t.deinit();
++    try t.writeFile("group", 0o664);
++    try t.writeFile("other", 0o646);
++    try expectRejected(try t.check("group"), "writable by its group");
++    try expectRejected(try t.check("other"), "writable by others");
++}
++
++test "system file: a writable directory is rejected unless sticky" {
++    var t = try TestDir.init();
++    defer t.deinit();
++    inline for (.{ "open", "sticky" }) |name| {
++        try t.tmp.dir.makeDir(name);
++        try t.writeFile(name ++ "/config.ghostty", 0o644);
++    }
++    var open_dir = try t.tmp.dir.openDir("open", .{});
++    defer open_dir.close();
++    try open_dir.chmod(0o775);
++    var sticky_dir = try t.tmp.dir.openDir("sticky", .{});
++    defer sticky_dir.close();
++    try sticky_dir.chmod(0o1777);
++
++    try expectRejected(try t.check("open/config.ghostty"), "writable by its group");
++    try expectFile(try t.check("sticky/config.ghostty"));
++}
++
++test "system file: symbolic links are followed and checked" {
++    var t = try TestDir.init();
++    defer t.deinit();
++    try t.tmp.dir.makeDir("store");
++    try t.writeFile("store/config.ghostty", 0o644);
++
++    // A relative link to a link with an absolute target, as nix-darwin
++    // links /etc into the Nix store.
++    const abs_target = try t.join("store/config.ghostty");
++    defer std.testing.allocator.free(abs_target);
++    try t.tmp.dir.symLink(abs_target, "static", .{});
++    try t.tmp.dir.symLink("./static", "config.ghostty", .{});
++    try expectFile(try t.check("config.ghostty"));
++
++    // ".." inside a link target resolves against the link's directory.
++    try t.tmp.dir.symLink("../store/config.ghostty", "store/up", .{});
++    try expectFile(try t.check("store/up"));
++
++    try t.tmp.dir.symLink("loop-b", "loop-a", .{});
++    try t.tmp.dir.symLink("loop-a", "loop-b", .{});
++    try expectRejected(try t.check("loop-a"), "too many levels of symbolic links");
++
++    try t.tmp.dir.symLink("missing", "dangling", .{});
++    try expectAbsent(try t.check("dangling"));
++}
++
++test "system file: directories and non-directories in the wrong place are rejected" {
++    var t = try TestDir.init();
++    defer t.deinit();
++    try t.tmp.dir.makeDir("dir");
++    try t.writeFile("file", 0o644);
++    try expectRejected(try t.check("dir"), "is a directory");
++    try expectRejected(try t.check("file/config.ghostty"), "is not a directory");
++}
++
++test "system file: an entry not owned by root is rejected" {
++    if (posix.getuid() == 0) return error.SkipZigTest;
++    var t = try TestDir.init();
++    defer t.deinit();
++    try t.writeFile("config.ghostty", 0o644);
++    const p = try t.join("config.ghostty");
++    defer std.testing.allocator.free(p);
++    try expectRejected(try open(std.testing.allocator, p, null), "not root");
++}
++
++test "system file: an access control list that allows changes is rejected" {
++    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
++    var t = try TestDir.init();
++    defer t.deinit();
++    try t.writeFile("allow", 0o644);
++    try t.writeFile("deny", 0o644);
++    try addAcl(&t, "allow", "everyone allow write");
++    try addAcl(&t, "deny", "everyone deny delete");
++    try expectRejected(try t.check("allow"), "an access control list allows changes");
++    try expectFile(try t.check("deny"));
++}
++
++fn addAcl(t: *const TestDir, sub: []const u8, entry: []const u8) !void {
++    const alloc = std.testing.allocator;
++    const p = try t.join(sub);
++    defer alloc.free(p);
++    const result = try std.process.Child.run(.{
++        .allocator = alloc,
++        .argv = &.{ "/bin/chmod", "+a", entry, p },
++    });
++    defer alloc.free(result.stdout);
++    defer alloc.free(result.stderr);
++    try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
++}
+--- a/src/config/theme.zig
++++ b/src/config/theme.zig
+@@ -69,6 +69,12 @@
+     /// similar allocator implementation) should be used. It may not be safe to
+     /// free the returned allocations.
+     arena_alloc: Allocator,
++
++    /// Whether to search the user's theme directory. The system
++    /// configuration can turn user files off, and themes are configuration
++    /// files too.
++    user: bool = true,
++
+     i: usize = 0,
+ 
+     pub fn next(self: *LocationIterator) !?struct {
+@@ -79,6 +85,7 @@
+         while (self.i < max) {
+             const location: Location = @enumFromInt(self.i);
+             self.i += 1;
++            if (location == .user and !self.user) continue;
+             if (try location.dir(self.arena_alloc)) |dir|
+                 return .{
+                     .location = location,
+@@ -107,10 +114,14 @@
+ /// This will never return anything other than a handle to a regular file. If
+ /// the theme resolves to something other than a regular file a diagnostic entry
+ /// will be added to the list and null will be returned.
++///
++/// With `user_themes` false, a theme given by name is not looked up in the
++/// user's theme directory.
+ pub fn open(
+     arena_alloc: Allocator,
+     theme: []const u8,
+     diags: *cli.DiagnosticList,
++    user_themes: bool,
+ ) error{OutOfMemory}!?struct {
+     path: []const u8,
+     file: std.fs.File,
+@@ -165,7 +176,7 @@
+ 
+     // Iterate over the possible locations to try to find the
+     // one that exists.
+-    var it: LocationIterator = .{ .arena_alloc = arena_alloc };
++    var it: LocationIterator = .{ .arena_alloc = arena_alloc, .user = user_themes };
+     const cwd = std.fs.cwd();
+     while (try it.next()) |loc| {
+         const path = try std.fs.path.join(arena_alloc, &.{ loc.dir, theme });
