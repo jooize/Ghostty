@@ -414,7 +414,7 @@ env-reset.patch.
 +    try testing.expect(!cfg._system.cli_args);
 +    try testing.expectEqual(1, cfg._diagnostics.items().len);
 +    const message = cfg._diagnostics.items()[0].message;
-+    try testing.expect(std.mem.indexOf(u8, message, "writable by others") != null);
++    try testing.expect(std.mem.indexOf(u8, message, "writable by its group") != null);
 +}
 +
 +test "system config: a missing file changes nothing unless the build requires it" {
