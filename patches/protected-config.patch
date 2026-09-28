@@ -1,0 +1,1156 @@
+Protect the user's configuration files (config-file-protection)
+
+Patch B gives an administrator settings that the user's processes cannot
+change, but a user configuration still lives in files that any process
+running as the user can rewrite, and a configuration can set the command
+Ghostty runs. Keeping a user configuration safe from those processes means
+loading only files the user cannot change: files owned by someone else, or
+files that carry a flag only root can clear.
+
+A new key, config-file-protection = required, does that. It is honored only
+in the system file and captured right after the system file loads, like
+config-default-files. The default is off, which behaves as upstream. With
+required, a file loads only if the running user can neither change it nor
+replace it. That covers every configuration file loaded after the system
+file: the default files, a file named by GHOSTTY_CONFIG_PATH, every
+config-file (nested ones too) and every theme file. It also covers every
+file a setting names: custom-shader, background-image, bell-audio-path,
+gtk-custom-css, input = path:..., and macos-custom-icon with macos-icon =
+custom.
+
+The check is patch B's walk from / with another rule for owners. An entry
+owned by anyone but the user passes. An entry the user owns passes only
+with a flag that only root can clear: schg, or sappnd on a directory
+(macOS and FreeBSD). Flags the user can clear, such as uchg, never count,
+and Linux has no such exception. The mode and ACL rules stay as in B,
+except that a macOS ACL on a directory may allow adding entries, since
+adding an entry cannot replace one that exists.
+
+Configuration files are read through the descriptor the check opened. Files
+a setting names are checked when the configuration is finalized and opened
+by path later. That is safe, because a path that passes is pinned against
+the user. A file that fails is not loaded, or its setting is dropped, and
+the configuration-errors window says why. The rest of the configuration
+still loads.
+
+With required, file locations never come from the environment. The default
+files and the user theme directory are found from the home directory in the
+user database, not from HOME, XDG_CONFIG_HOME or CFFIXED_USER_HOME. No
+template file is written, and an input path must be absolute. Once any
+system file is loaded, ~/ in a path also expands from the user database,
+in the system file itself and in every file after it.
+
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -2484,7 +2484,9 @@
+ /// Once a system file is loaded, Ghostty finds its resources directory for
+ /// themes from the location of the Ghostty executable alone and ignores
+ /// `GHOSTTY_RESOURCES_DIR`, since any process running as you can set that
+-/// variable for the next launch.
++/// variable for the next launch. For the same reason, `~/` in a path then
++/// means your home directory as the user database records it, whatever
++/// `HOME` says.
+ @"config-default-files": bool = true,
+ 
+ /// When this is false, configuration from command-line arguments is ignored,
+@@ -2495,6 +2497,45 @@
+ /// This is only honored in the system configuration file (see
+ /// `config-default-files`). Setting it anywhere else has no effect.
+ @"config-cli-args": bool = true,
++
++/// Whether the files your configuration is made of must be safe from change
++/// by you, the user running Ghostty. This guards your configuration against
++/// other programs running as you, since a configuration can set the command
++/// Ghostty runs. Valid values are:
++///
++///   * `off` - Load files as usual. This is the default.
++///
++///   * `required` - Load a file only if it passes the check below. This
++///     covers every file loaded after the system configuration file: the
++///     default configuration files, a file named by `GHOSTTY_CONFIG_PATH` on
++///     macOS, every `config-file` and every theme file. It also covers every
++///     file a setting names: `custom-shader`, `background-image`,
++///     `bell-audio-path`, `gtk-custom-css`, `input = path:...` and, with
++///     `macos-icon = custom`, `macos-custom-icon`.
++///
++/// A file passes when you can neither change it nor replace it. Every entry
++/// on the way to it, from `/` down, must be owned by someone other than you,
++/// or be yours and carry a flag that only root can clear: `schg` on a file,
++/// `schg` or `sappnd` on a directory (see `chflags`, macOS and FreeBSD).
++/// Flags you can clear yourself, such as `uchg`, do not count. No directory
++/// on the way may be writable by its group or others unless it is sticky,
++/// and the file may not be writable by its group or others. On macOS, no
++/// access control list may allow changes, except that one on a directory
++/// may let anyone add new entries.
++///
++/// A configuration or theme file that fails the check is not loaded, and a
++/// setting that names such a file is ignored. The configuration errors
++/// window says why, and the rest of the configuration still loads.
++///
++/// With `required`, file locations never come from the environment. The
++/// default configuration files and the user theme directory are found in
++/// your home directory as the user database records it, not through
++/// `HOME`, `XDG_CONFIG_HOME` or `CFFIXED_USER_HOME`. No template
++/// configuration file is written. An `input` path must be absolute.
++///
++/// This is only honored in the system configuration file (see
++/// `config-default-files`). Setting it anywhere else has no effect.
++@"config-file-protection": ConfigFileProtection = .off,
+ 
+ /// Confirms that a surface should be closed before closing it.
+ ///
+@@ -3892,6 +3933,15 @@
+ /// `path` must be resolved and absolute.
+ pub fn loadFile(self: *Config, alloc: Allocator, path: []const u8) !void {
+     assert(std.fs.path.isAbsolute(path));
++    if (self._system.protection == .required) {
++        var file = self.openConfigFile(path) catch |err| switch (err) {
++            error.ProtectedFileRejected => return,
++            else => return err,
++        };
++        defer file.close();
++        return try self.loadFsFile(alloc, &file, path);
++    }
++
+     var file = file_load.open(path) catch |err| switch (err) {
+         error.NotAFile => {
+             log.warn(
+@@ -4018,6 +4068,12 @@
+     );
+ }
+ 
++/// See `config-file-protection`.
++pub const ConfigFileProtection = enum {
++    off,
++    required,
++};
++
+ /// What the system configuration file decided. It is kept apart from the
+ /// public fields so that nothing loaded after the system file can change it.
+ const System = struct {
+@@ -4035,6 +4091,10 @@
+     /// Whether command-line configuration may be loaded.
+     cli_args: bool = true,
+ 
++    /// Whether files loaded after the system file must pass the check in
++    /// system_file.zig. See `config-file-protection`.
++    protection: ConfigFileProtection = .off,
++
+     /// The replay steps the system file recorded. These are only valid
+     /// until finalize, which rebuilds the replay steps for themes.
+     replay_start: usize = 0,
+@@ -4068,6 +4128,7 @@
+     // loaded, so that an error on the way fails closed.
+     self._system.default_files = false;
+     self._system.cli_args = false;
++    self._system.protection = .required;
+ 
+     const arena_alloc = self._arena.?.allocator();
+     var file = switch (try system_file.open(arena_alloc, path, trusted_uid)) {
+@@ -4076,6 +4137,7 @@
+             .optional => {
+                 self._system.default_files = true;
+                 self._system.cli_args = true;
++                self._system.protection = .off;
+                 return;
+             },
+             .required => return try self.rejectSystemFile(path, try std.fmt.allocPrint(
+@@ -4104,8 +4166,10 @@
+     // public fields back so a later value has nothing to change.
+     self._system.default_files = self.@"config-default-files";
+     self._system.cli_args = self.@"config-cli-args";
++    self._system.protection = self.@"config-file-protection";
+     self.@"config-default-files" = true;
+     self.@"config-cli-args" = true;
++    self.@"config-file-protection" = .off;
+ }
+ 
+ /// Fall back to the built-in defaults and say why. A system file that
+@@ -4129,8 +4193,264 @@
+     log.warn("{s}", .{diag.message});
+     try self._diagnostics.append(arena_alloc, diag);
+     try self._replay_steps.append(arena_alloc, .{ .diagnostic = diag });
++}
++
++/// Open a configuration file by its absolute path. Under
++/// `config-file-protection = required`, the file must pass the check in
++/// system_file.zig and is opened through it. A file that fails is reported
++/// as a diagnostic, and error.ProtectedFileRejected is returned.
++fn openConfigFile(self: *Config, path: []const u8) !std.fs.File {
++    if (self._system.protection != .required) {
++        return try std.fs.openFileAbsolute(path, .{});
++    }
++
++    const arena_alloc = self._arena.?.allocator();
++    return switch (try system_file.openProtected(arena_alloc, path, std.posix.getuid())) {
++        .file => |file| file,
++        .absent => error.FileNotFound,
++        .rejected => |reason| {
++            const diag: cli.Diagnostic = .{
++                .message = try std.fmt.allocPrintSentinel(
++                    arena_alloc,
++                    "not loading {s}: {s}",
++                    .{ path, reason },
++                    0,
++                ),
++            };
++            log.warn("{s}", .{diag.message});
++            try self._diagnostics.append(arena_alloc, diag);
++            try self._replay_steps.append(arena_alloc, .{ .diagnostic = diag });
++            return error.ProtectedFileRejected;
++        },
++    };
++}
++
++/// loadDefaultFiles under `config-file-protection = required`. The files
++/// are the usual ones, but their locations come from the home directory in
++/// the user database, never from HOME, XDG_CONFIG_HOME or CFFIXED_USER_HOME,
++/// which any process running as the user can set for the next launch.
++/// loadFile checks each file, and no template file is written.
++fn loadProtectedDefaultFiles(self: *Config, alloc: Allocator) !void {
++    const home = try system_file.userHome(alloc) orelse {
++        const arena_alloc = self._arena.?.allocator();
++        const diag: cli.Diagnostic = .{
++            .message = "not loading the default configuration files: " ++
++                "the user database has no home directory for you",
++        };
++        log.warn("{s}", .{diag.message});
++        try self._diagnostics.append(arena_alloc, diag);
++        try self._replay_steps.append(arena_alloc, .{ .diagnostic = diag });
++        return;
++    };
++    defer alloc.free(home);
++
++    const xdg_dir = try internal_os.xdg.config(alloc, .{
++        .subdir = "ghostty",
++        .home = home,
++    });
++    defer alloc.free(xdg_dir);
++    try self.loadProtectedDefaultDir(alloc, xdg_dir);
++
++    if (comptime builtin.os.tag == .macos) {
++        const app_support_dir = try std.fs.path.join(alloc, &.{
++            home,
++            "Library",
++            "Application Support",
++            build_config.bundle_id,
++        });
++        defer alloc.free(app_support_dir);
++        try self.loadProtectedDefaultDir(alloc, app_support_dir);
++    }
++}
++
++/// Load the legacy `config` file and then `config.ghostty` from `dir`.
++fn loadProtectedDefaultDir(self: *Config, alloc: Allocator, dir: []const u8) !void {
++    for ([_][]const u8{ "config", "config.ghostty" }) |name| {
++        const path = try std.fs.path.join(alloc, &.{ dir, name });
++        defer alloc.free(path);
++        _ = self.loadOptionalFile(alloc, path);
++    }
++}
++
++/// Expand a leading `~/` in a path value from `home`, the home directory in
++/// the user database (see expandPaths). Without one, the path is blanked
++/// and a diagnostic says why, as Path.expand does when it finds no home.
++fn expandUserHome(
++    self: *Config,
++    value: anytype,
++    home: ?[]const u8,
++) Allocator.Error!void {
++    switch (@TypeOf(value.*)) {
++        RepeatablePath => for (value.value.items) |*path| {
++            try self.expandUserHome(path, home);
++        },
++
++        Path => {
++            const path = switch (value.*) {
++                .optional, .required => |path| path,
++            };
++            if (!std.mem.startsWith(u8, path, "~/")) return;
++
++            const arena_alloc = self._arena.?.allocator();
++            const home_dir = home orelse {
++                try self._diagnostics.append(arena_alloc, .{
++                    .message = try std.fmt.allocPrintSentinel(
++                        arena_alloc,
++                        "error expanding home directory for path {s}: " ++
++                            "the user database has no home directory for you",
++                        .{path},
++                        0,
++                    ),
++                });
++                value.* = .{ .required = "" };
++                return;
++            };
++            const expanded = try std.mem.concatWithSentinel(
++                arena_alloc,
++                u8,
++                &.{ home_dir, path[1..] },
++                0,
++            );
++            switch (value.*) {
++                .optional, .required => |*p| p.* = expanded,
++            }
++        },
++
++        else => @compileError("not a path type"),
++    }
++}
++
++/// Under `config-file-protection = required`, drop every file a setting
++/// names that fails the check in system_file.zig, with a diagnostic that
++/// says why. The file is opened by its path later, but a path that passes
++/// is pinned: the user can change neither the file nor any directory on
++/// the way to it.
++fn checkProtectedFiles(self: *Config) !void {
++    if (self._system.protection != .required) return;
++
++    inline for (@typeInfo(Config).@"struct".fields) |field| {
++        switch (field.type) {
++            // loadRecursiveFiles checks each config-file as it opens it.
++            RepeatablePath => if (comptime !std.mem.eql(u8, field.name, "config-file")) {
++                const list = &@field(self, field.name).value;
++                var kept: usize = 0;
++                for (list.items) |path| {
++                    if (!try self.checkProtectedPath(field.name, path)) continue;
++                    list.items[kept] = path;
++                    kept += 1;
++                }
++                list.shrinkRetainingCapacity(kept);
++            },
++
++            ?Path => if (@field(self, field.name)) |path| {
++                if (!try self.checkProtectedPath(field.name, path)) {
++                    @field(self, field.name) = null;
++                }
++            },
++
++            // A path that cannot be dropped needs its own handling here.
++            Path, ?RepeatablePath => @compileError(
++                "config-file-protection does not check " ++ field.name,
++            ),
++
++            else => {},
++        }
++    }
++
++    // An input path is read into the terminal as if typed. It is opened
++    // later with its escape sequences parsed (ReadableIO.cloneParsed), so
++    // that is the path to check.
++    {
++        const arena_alloc = self._arena.?.allocator();
++        const list = &self.input.list;
++        var kept: usize = 0;
++        for (list.items) |item| {
++            switch (item) {
++                .raw => {},
++                .path => |raw| {
++                    const buf = try arena_alloc.alloc(u8, raw.len);
++                    const path = string.parse(buf, raw) catch continue;
++                    if (!try self.checkProtectedFile("input", path, false)) continue;
++                },
++            }
++            list.items[kept] = item;
++            kept += 1;
++        }
++        list.shrinkRetainingCapacity(kept);
++    }
++
++    // The macOS app loads the custom icon from ~/.config/ghostty/Ghostty.icns
++    // when `macos-custom-icon` is unset. If the file fails the check, the
++    // official icon is used.
++    if (comptime builtin.os.tag == .macos) if (self.@"macos-icon" == .custom) {
++        const arena_alloc = self._arena.?.allocator();
++        const value = self.@"macos-custom-icon" orelse "~/.config/ghostty/Ghostty.icns";
++        const path: [:0]const u8 = if (std.mem.startsWith(u8, value, "~/"))
++            if (try system_file.userHome(arena_alloc)) |home|
++                try std.mem.concatWithSentinel(arena_alloc, u8, &.{ home, value[1..] }, 0)
++            else
++                value
++        else
++            value;
++        const optional = self.@"macos-custom-icon" == null;
++        if (try self.checkProtectedFile("macos-custom-icon", path, optional)) {
++            self.@"macos-custom-icon" = path;
++        } else {
++            self.@"macos-icon" = .official;
++        }
++    };
+ }
+ 
++/// checkProtectedFile for a Path value.
++fn checkProtectedPath(self: *Config, comptime key: [:0]const u8, path: Path) !bool {
++    return switch (path) {
++        // Path.expand blanks a path it cannot expand, and reports it.
++        .optional, .required => |value| if (value.len == 0)
++            false
++        else
++            try self.checkProtectedFile(key, value, path == .optional),
++    };
++}
++
++/// Whether the file at `path`, named by the setting `key`, passes the check
++/// for `config-file-protection`. If not, a diagnostic says why, unless the
++/// file is optional and does not exist.
++fn checkProtectedFile(
++    self: *Config,
++    comptime key: [:0]const u8,
++    path: []const u8,
++    optional: bool,
++) !bool {
++    const arena_alloc = self._arena.?.allocator();
++    const reason: []const u8 = check: {
++        if (!std.fs.path.isAbsolute(path)) break :check "not an absolute path";
++        switch (try system_file.openProtected(arena_alloc, path, std.posix.getuid())) {
++            .file => |file| {
++                file.close();
++                return true;
++            },
++            .absent => {
++                if (optional) return false;
++                break :check "it does not exist";
++            },
++            .rejected => |message| break :check message,
++        }
++    };
++
++    const diag: cli.Diagnostic = .{
++        .key = key,
++        .message = try std.fmt.allocPrintSentinel(
++            arena_alloc,
++            "not loading {s}: {s}",
++            .{ path, reason },
++            0,
++        ),
++    };
++    log.warn("{s}: {s}", .{ key, diag.message });
++    try self._diagnostics.append(arena_alloc, diag);
++    return false;
++}
++
+ test {
+     _ = system_file;
+ }
+@@ -4259,6 +4579,141 @@
+             try testing.expect(!cfg._system.cli_args);
+         },
+     }
++}
++
++/// Whether `cfg` has a diagnostic for `key` whose message contains `needle`.
++fn testHasDiagnostic(cfg: *const Config, key: []const u8, needle: []const u8) bool {
++    for (cfg._diagnostics.items()) |diag| {
++        if (std.mem.eql(u8, diag.key, key) and
++            std.mem.indexOf(u8, diag.message, needle) != null) return true;
++    }
++    return false;
++}
++
++test "config-file-protection: only the system file can turn it on" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++
++    {
++        const path = try testSystemFile(&tmp, "config-file-protection = required\n", 0o644);
++        defer alloc.free(path);
++        var cfg = try Config.default(alloc);
++        defer cfg.deinit();
++        try cfg.loadSystemFileAt(alloc, path, std.posix.getuid());
++        try testing.expect(cfg._diagnostics.empty());
++        try testing.expectEqual(.required, cfg._system.protection);
++        try testing.expectEqual(.off, cfg.@"config-file-protection");
++
++        var reader: std.Io.Reader = .fixed("config-file-protection = off\n");
++        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
++        try testing.expectEqual(.required, cfg._system.protection);
++    }
++
++    {
++        const path = try testSystemFile(&tmp, "font-size = 20\n", 0o644);
++        defer alloc.free(path);
++        var cfg = try Config.default(alloc);
++        defer cfg.deinit();
++        try cfg.loadSystemFileAt(alloc, path, std.posix.getuid());
++        try testing.expectEqual(.off, cfg._system.protection);
++
++        var reader: std.Io.Reader = .fixed("config-file-protection = required\n");
++        try cfg.loadReader(alloc, &reader, "/home/ghostty/.config/ghostty/config.ghostty");
++        try testing.expectEqual(.off, cfg._system.protection);
++    }
++}
++
++// The tests below rely on the test user owning the temporary directory
++// without a system flag, so that a user file in it fails the check.
++
++test "config-file-protection: a configuration file that fails the check is not loaded" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(.{ .sub_path = "user.ghostty", .data = "font-size = 30\n" });
++    const path = try testSystemFile(&tmp,
++        \\config-file-protection = required
++        \\config-file = user.ghostty
++        \\config-file = ?missing.ghostty
++        \\
++    , 0o644);
++    defer alloc.free(path);
++
++    var cfg = try Config.default(alloc);
++    defer cfg.deinit();
++    try cfg.loadSystemFileAt(alloc, path, std.posix.getuid());
++    try cfg.loadRecursiveFiles(alloc);
++
++    var defaults = try Config.default(alloc);
++    defer defaults.deinit();
++    try testing.expectEqual(defaults.@"font-size", cfg.@"font-size");
++    try testing.expectEqual(1, cfg._diagnostics.items().len);
++    try testing.expect(testHasDiagnostic(&cfg, "", "owned by you"));
++
++    // The same for a file loaded directly, as the macOS app loads a file
++    // named by GHOSTTY_CONFIG_PATH.
++    const user_path = try std.fs.path.join(alloc, &.{
++        std.fs.path.dirname(path).?,
++        "user.ghostty",
++    });
++    defer alloc.free(user_path);
++    try cfg.loadFile(alloc, user_path);
++    try testing.expectEqual(defaults.@"font-size", cfg.@"font-size");
++    try testing.expectEqual(2, cfg._diagnostics.items().len);
++}
++
++test "config-file-protection: a file a setting names must pass the check" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(.{ .sub_path = "shader.glsl", .data = "" });
++    const path = try testSystemFile(&tmp,
++        \\config-file-protection = required
++        \\custom-shader = shader.glsl
++        \\background-image = ?missing.png
++        \\bell-audio-path = missing.wav
++        \\input = raw:hello
++        \\input = path:relative.txt
++        \\
++    , 0o644);
++    defer alloc.free(path);
++
++    var cfg = try Config.default(alloc);
++    defer cfg.deinit();
++    try cfg.loadSystemFileAt(alloc, path, std.posix.getuid());
++    try cfg.finalize();
++
++    try testing.expectEqual(0, cfg.@"custom-shader".value.items.len);
++    try testing.expect(cfg.@"background-image" == null);
++    try testing.expect(cfg.@"bell-audio-path" == null);
++    try testing.expectEqual(1, cfg.input.list.items.len);
++    try testing.expect(testHasDiagnostic(&cfg, "custom-shader", "owned by you"));
++    try testing.expect(testHasDiagnostic(&cfg, "bell-audio-path", "does not exist"));
++    try testing.expect(testHasDiagnostic(&cfg, "input", "not an absolute path"));
++    try testing.expect(!testHasDiagnostic(&cfg, "background-image", ""));
++}
++
++test "config-file-protection: ~/ comes from the user database once a system file is loaded" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const path = try testSystemFile(&tmp, "custom-shader = ~/ghostty-test.glsl\n", 0o644);
++    defer alloc.free(path);
++
++    var cfg = try Config.default(alloc);
++    defer cfg.deinit();
++    try cfg.loadSystemFileAt(alloc, path, std.posix.getuid());
++
++    const home = (try system_file.userHome(alloc)).?;
++    defer alloc.free(home);
++    const expected = try std.fs.path.join(alloc, &.{ home, "ghostty-test.glsl" });
++    defer alloc.free(expected);
++    try testing.expectEqualStrings(expected, cfg.@"custom-shader".value.items[0].required);
+ }
+ 
+ /// Load configurations from the default configuration files. The default
+@@ -4277,6 +4732,9 @@
+         log.info("the system configuration turned off user configuration files", .{});
+         return;
+     }
++    if (self._system.protection == .required) {
++        return try self.loadProtectedDefaultFiles(alloc);
++    }
+ 
+     // Load XDG first
+     const legacy_xdg_path = try file_load.legacyDefaultXdgPath(alloc);
+@@ -4455,6 +4913,7 @@
+         new_config._system.replay_end = new_config._replay_steps.items.len;
+         new_config.@"config-default-files" = true;
+         new_config.@"config-cli-args" = true;
++        new_config.@"config-file-protection" = .off;
+ 
+         var it = Replay.iterator(
+             self._replay_steps.items[replay_len_start..replay_len_end],
+@@ -4531,7 +4990,8 @@
+             continue;
+         }
+ 
+-        var file = std.fs.openFileAbsolute(path, .{}) catch |err| {
++        var file = self.openConfigFile(path) catch |err| {
++            if (err == error.ProtectedFileRejected) continue;
+             if (err != error.FileNotFound or !optional) {
+                 const diag: cli.Diagnostic = .{
+                     .message = try std.fmt.allocPrintSentinel(
+@@ -4653,10 +5113,21 @@
+         .{ .expand = try arena_alloc.dupe(u8, base) },
+     );
+ 
++    // Once a system configuration file is loaded, `~/` means the home
++    // directory in the user database. HOME comes from the environment,
++    // which any process running as the user can set for the next launch.
++    const home: ?[]const u8 = if (self._system.trusted)
++        try system_file.userHome(arena_alloc)
++    else
++        null;
++
+     // Expand all of our paths
+     inline for (@typeInfo(Config).@"struct".fields) |field| {
+         switch (field.type) {
+             RepeatablePath, Path => {
++                if (self._system.trusted) {
++                    try self.expandUserHome(&@field(self, field.name), home);
++                }
+                 try @field(self, field.name).expand(
+                     arena_alloc,
+                     base,
+@@ -4665,6 +5136,7 @@
+             },
+             ?RepeatablePath, ?Path => {
+                 if (@field(self, field.name)) |*path| {
++                    if (self._system.trusted) try self.expandUserHome(path, home);
+                     try path.expand(
+                         arena_alloc,
+                         base,
+@@ -4685,15 +5157,26 @@
+         .light => theme.light,
+         .dark => theme.dark,
+     };
++
++    // Under protection, the user theme directory is found from the home
++    // directory in the user database, and skipped without one.
++    const arena_alloc = self._arena.?.allocator();
++    const protected = self._system.protection == .required;
++    const home: ?[]const u8 = if (protected)
++        try system_file.userHome(arena_alloc)
++    else
++        null;
+ 
+     // Find our theme file and open it. See the open function for details.
+     const themefile = (try themepkg.open(
+-        self._arena.?.allocator(),
++        arena_alloc,
+         name,
+         &self._diagnostics,
+         .{
+-            .user = self._system.default_files,
++            .user = self._system.default_files and (!protected or home != null),
+             .resources_env = !self._system.trusted,
++            .home = home,
++            .protected = protected,
+         },
+     )) orelse return;
+     const path = themefile.path;
+@@ -4800,6 +5283,9 @@
+             self._conditional_set.insert(.theme);
+         }
+     }
++
++    // A theme can name files too, so this comes after the theme.
++    try self.checkProtectedFiles();
+ 
+     const alloc = self._arena.?.allocator();
+ 
+@@ -4911,6 +5397,20 @@
+             }
+         }
+     }
++
++    // See expandPaths: once a system configuration file is loaded, `~/`
++    // comes from the user database, not HOME.
++    if (self._system.trusted) if (wd.value()) |path| {
++        if (std.mem.startsWith(u8, path, "~/")) {
++            if (try system_file.userHome(alloc)) |home| {
++                wd = .{ .path = try std.mem.concat(alloc, u8, &.{ home, path[1..] }) };
++            } else {
++                log.warn("no home directory in the user database for working-directory path={s}", .{path});
++                wd = .inherit;
++            }
++        }
++    };
++
+     try wd.finalize(alloc);
+     self.@"working-directory" = wd;
+ 
+--- a/src/config/system_file.zig
++++ b/src/config/system_file.zig
+@@ -3,6 +3,9 @@
+ //! turn user files and command-line configuration off (see
+ //! `config-default-files` and `config-cli-args`), so it is only trusted
+ //! when nobody but root can change it.
++//!
++//! The same check, with a different rule for owners, protects the files a
++//! user configuration is made of (see `config-file-protection`).
+ const std = @import("std");
+ const builtin = @import("builtin");
+ const assert = std.debug.assert;
+@@ -54,12 +57,79 @@
+     alloc: Allocator,
+     abs_path: []const u8,
+     trusted_uid: ?posix.uid_t,
++) Allocator.Error!Result {
++    return try openPolicy(alloc, abs_path, .{ .root = trusted_uid });
++}
++
++/// Open the file at `abs_path` if the user `uid` can neither change it nor
++/// swap it for another, for `config-file-protection`. Callers pass the
++/// running user; tests pass another uid so that the test user's files count
++/// as someone else's.
++///
++/// The walk and the rules are those of `open`, except for owners:
++///
++///   * An entry owned by anyone but `uid` passes the owner rule.
++///   * An entry owned by `uid` passes only with a flag that only root can
++///     clear: `sappnd` or `schg` on a directory, `schg` on anything else.
++///     Flags the user can clear, such as `uchg`, do not count. Systems
++///     without file flags (Linux) have no such exception.
++///   * On macOS, an access control list on a directory may let anyone add
++///     entries, since adding an entry cannot replace one that exists. On a
++///     file the same bits mean write and append, and still fail.
++///
++/// A file that does not exist is absent even if a directory on the way
++/// fails the check, since nothing is loaded either way.
++pub fn openProtected(
++    alloc: Allocator,
++    abs_path: []const u8,
++    uid: posix.uid_t,
++) Allocator.Error!Result {
++    // Path functions assert that a path has no NUL byte, and C code would
++    // stop reading at one.
++    if (std.mem.indexOfScalar(u8, abs_path, 0)) |i| {
++        return .{ .rejected = try std.fmt.allocPrintSentinel(
++            alloc,
++            "{s}: the path contains a NUL byte",
++            .{abs_path[0..i]},
++            0,
++        ) };
++    }
++
++    const result = try openPolicy(alloc, abs_path, .{ .not_user = uid });
++    if (result == .rejected) {
++        std.fs.accessAbsolute(abs_path, .{}) catch |err| switch (err) {
++            error.FileNotFound => {
++                alloc.free(result.rejected);
++                return .absent;
++            },
++            else => {},
++        };
++    }
++    return result;
++}
++
++/// Who must be unable to change a file for it to pass.
++const Policy = union(enum) {
++    /// Nobody but root: every entry on the way is owned by root, or by this
++    /// uid if set (only tests set it). The rule for the system file.
++    root: ?posix.uid_t,
++
++    /// Not the user with this uid: every entry on the way is owned by
++    /// someone else, or by this user and protected by a flag that only root
++    /// can clear. The rule for `config-file-protection`.
++    not_user: posix.uid_t,
++};
++
++fn openPolicy(
++    alloc: Allocator,
++    abs_path: []const u8,
++    policy: Policy,
+ ) Allocator.Error!Result {
+     assert(std.fs.path.isAbsolute(abs_path));
+ 
+     var walk: Walk = .{
+         .arena = .init(alloc),
+-        .trusted_uid = trusted_uid,
++        .policy = policy,
+     };
+     defer walk.deinit();
+ 
+@@ -69,6 +139,20 @@
+     };
+ }
+ 
++/// The home directory of the running user from the user database, never
++/// from HOME, which any process running as the user can set for the next
++/// launch. Null if the database has no entry for the user or its home is
++/// not an absolute path. The result is allocated with `alloc`.
++pub fn userHome(alloc: Allocator) Allocator.Error!?[]const u8 {
++    var buf: [4096]u8 = undefined;
++    var pw: std.c.passwd = undefined;
++    var entry: ?*std.c.passwd = null;
++    if (std.c.getpwuid_r(std.c.getuid(), &pw, &buf, buf.len, &entry) != 0) return null;
++    const home = std.mem.sliceTo((entry orelse return null).dir orelse return null, 0);
++    if (!std.fs.path.isAbsolute(home)) return null;
++    return try alloc.dupe(u8, home);
++}
++
+ /// Symlinks followed before the path counts as a loop, as in most kernels.
+ const max_symlinks = 32;
+ 
+@@ -76,7 +160,7 @@
+ 
+ const Walk = struct {
+     arena: std.heap.ArenaAllocator,
+-    trusted_uid: ?posix.uid_t,
++    policy: Policy,
+ 
+     /// The directories entered so far, from the root down to the current
+     /// one. Each is open and has passed `checkDir`.
+@@ -232,7 +316,7 @@
+         if (st.mode & posix.S.IWOTH != 0) {
+             return self.reject("{s}: writable by others", .{entry_path});
+         }
+-        try self.checkAcl(entry_path, fd);
++        try self.checkAcl(entry_path, fd, false);
+         return .{ .handle = fd };
+     }
+ 
+@@ -253,9 +337,27 @@
+     }
+ 
+     fn checkOwner(self: *Walk, entry_path: []const u8, st: posix.Stat) Error!void {
+-        if (st.uid == 0) return;
+-        if (self.trusted_uid) |uid| if (st.uid == uid) return;
+-        return self.reject("{s}: owned by uid {d}, not root", .{ entry_path, st.uid });
++        switch (self.policy) {
++            .root => |trusted_uid| {
++                if (st.uid == 0) return;
++                if (trusted_uid) |uid| if (st.uid == uid) return;
++                return self.reject("{s}: owned by uid {d}, not root", .{ entry_path, st.uid });
++            },
++
++            .not_user => |uid| {
++                if (st.uid != uid) return;
++                if (systemFlagProtects(st)) return;
++                if (comptime !has_system_flags) {
++                    return self.reject("{s}: owned by you", .{entry_path});
++                }
++                if (posix.S.ISDIR(st.mode)) {
++                    return self.reject("{s}: owned by you and not protected by a " ++
++                        "system flag (sappnd or schg)", .{entry_path});
++                }
++                return self.reject("{s}: owned by you and not protected by a " ++
++                    "system flag (schg)", .{entry_path});
++            },
++        }
+     }
+ 
+     fn checkDir(
+@@ -274,10 +376,15 @@
+                 return self.reject("{s}: writable by others", .{dir_path});
+             }
+         }
+-        try self.checkAcl(dir_path, fd);
++        try self.checkAcl(dir_path, fd, true);
+     }
+ 
+-    fn checkAcl(self: *Walk, entry_path: []const u8, fd: posix.fd_t) Error!void {
++    fn checkAcl(
++        self: *Walk,
++        entry_path: []const u8,
++        fd: posix.fd_t,
++        is_dir: bool,
++    ) Error!void {
+         if (comptime !builtin.os.tag.isDarwin()) return;
+ 
+         const acl = darwin_acl.acl_get_fd_np(fd, darwin_acl.ACL_TYPE_EXTENDED) orelse {
+@@ -297,11 +404,18 @@
+                 return self.reject("{s}: cannot read its access control list", .{entry_path});
+             }
+             if (tag != darwin_acl.ACL_EXTENDED_ALLOW) continue;
++            var granted: c_int = 0;
+             for (darwin_acl.write_perms) |perm| {
+-                if (darwin_acl.acl_get_perm_np(permset, perm) == 1) {
+-                    return self.reject("{s}: an access control list allows changes", .{entry_path});
+-                }
++                if (darwin_acl.acl_get_perm_np(permset, perm) == 1) granted |= perm;
+             }
++            if (granted == 0) continue;
++
++            // For `config-file-protection`, a directory may let anyone add
++            // entries: adding cannot replace an entry that exists.
++            if (self.policy == .not_user and is_dir and
++                granted & ~darwin_acl.add_perms == 0) continue;
++
++            return self.reject("{s}: an access control list allows changes", .{entry_path});
+         }
+     }
+ 
+@@ -311,6 +425,31 @@
+     }
+ };
+ 
++/// Whether this system has file flags (see chflags(2)).
++const has_system_flags = switch (builtin.os.tag) {
++    .macos, .ios, .tvos, .watchos, .visionos, .freebsd => true,
++    else => false,
++};
++
++/// The file flags used here; the values are the same on macOS and FreeBSD
++/// (<sys/stat.h>). Only root can clear the SF_ flags; the UF_ flags are
++/// for tests, since the owner can clear them.
++const file_flags = struct {
++    const SF_IMMUTABLE: u32 = 0x00020000;
++    const SF_APPEND: u32 = 0x00040000;
++    const UF_IMMUTABLE: u32 = 0x00000002;
++    const UF_APPEND: u32 = 0x00000004;
++};
++
++/// Whether an entry carries a flag that keeps even its owner from changing
++/// it and that only root can clear: `schg` on any entry, or `sappnd` on a
++/// directory, where it keeps entries from being renamed or removed.
++fn systemFlagProtects(st: posix.Stat) bool {
++    if (comptime !has_system_flags) return false;
++    if (st.flags & file_flags.SF_IMMUTABLE != 0) return true;
++    return posix.S.ISDIR(st.mode) and st.flags & file_flags.SF_APPEND != 0;
++}
++
+ /// The part of <sys/acl.h> used here; the values are from the macOS SDK.
+ const darwin_acl = struct {
+     const ACL_TYPE_EXTENDED: c_int = 0x00000100;
+@@ -330,6 +469,10 @@
+         1 << 13, // ACL_CHANGE_OWNER
+     };
+ 
++    /// The permissions in `write_perms` that on a directory only add
++    /// entries: ACL_ADD_FILE and ACL_ADD_SUBDIRECTORY.
++    const add_perms: c_int = (1 << 2) | (1 << 5);
++
+     extern "c" fn acl_get_fd_np(fd: c_int, ty: c_int) ?*anyopaque;
+     extern "c" fn acl_free(obj: *anyopaque) c_int;
+     extern "c" fn acl_get_entry(acl: *anyopaque, entry_id: c_int, entry: *?*anyopaque) c_int;
+@@ -376,6 +519,12 @@
+         defer std.testing.allocator.free(p);
+         return try open(std.testing.allocator, p, posix.getuid());
+     }
++
++    fn checkProtected(self: *const TestDir, sub: []const u8, uid: posix.uid_t) !Result {
++        const p = try self.join(sub);
++        defer std.testing.allocator.free(p);
++        return try openProtected(std.testing.allocator, p, uid);
++    }
+ };
+ 
+ fn expectFile(result: Result) !void {
+@@ -532,3 +681,96 @@
+     defer alloc.free(result.stderr);
+     try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
+ }
++
++// The tests for `openProtected` pass a uid other than the test user's, so
++// that the test user's files count as someone else's, or the test user's
++// own uid to check what happens to files the user owns.
++
++fn otherUid() posix.uid_t {
++    return posix.getuid() +% 1;
++}
++
++test "protected file: an entry owned by someone else passes" {
++    var t = try TestDir.init();
++    defer t.deinit();
++    try t.writeFile("config.ghostty", 0o644);
++    try t.writeFile("group", 0o664);
++    try expectFile(try t.checkProtected("config.ghostty", otherUid()));
++    try expectRejected(try t.checkProtected("group", otherUid()), "writable by its group");
++}
++
++test "protected file: an entry you own fails without a system flag" {
++    var t = try TestDir.init();
++    defer t.deinit();
++    try t.writeFile("config.ghostty", 0o644);
++    try expectRejected(try t.checkProtected("config.ghostty", posix.getuid()), "owned by you");
++
++    // A missing file is absent even though a directory on the way fails.
++    try expectAbsent(try t.checkProtected("missing", posix.getuid()));
++    try expectAbsent(try t.checkProtected("missing/config.ghostty", posix.getuid()));
++}
++
++test "protected file: only a flag that root alone can clear counts" {
++    if (comptime !has_system_flags) return error.SkipZigTest;
++    const testing = std.testing;
++    var st = std.mem.zeroes(posix.Stat);
++
++    st.mode = posix.S.IFDIR | 0o755;
++    for ([_]u32{ file_flags.SF_IMMUTABLE, file_flags.SF_APPEND }) |flags| {
++        st.flags = flags;
++        try testing.expect(systemFlagProtects(st));
++    }
++    for ([_]u32{ 0, file_flags.UF_IMMUTABLE, file_flags.UF_APPEND }) |flags| {
++        st.flags = flags;
++        try testing.expect(!systemFlagProtects(st));
++    }
++
++    inline for (.{ posix.S.IFREG, posix.S.IFLNK }) |kind| {
++        st.mode = kind | 0o644;
++        st.flags = file_flags.SF_IMMUTABLE;
++        try testing.expect(systemFlagProtects(st));
++        for ([_]u32{ 0, file_flags.SF_APPEND, file_flags.UF_IMMUTABLE, file_flags.UF_APPEND }) |flags| {
++            st.flags = flags;
++            try testing.expect(!systemFlagProtects(st));
++        }
++    }
++}
++
++test "protected file: an access control list may only add entries to a directory" {
++    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
++    var t = try TestDir.init();
++    defer t.deinit();
++    inline for (.{ "add", "delete" }) |name| {
++        try t.tmp.dir.makeDir(name);
++        try t.writeFile(name ++ "/config.ghostty", 0o644);
++    }
++    try t.writeFile("write", 0o644);
++    try t.writeFile("append", 0o644);
++    try addAcl(&t, "add", "everyone allow add_file,add_subdirectory");
++    try addAcl(&t, "delete", "everyone allow add_file,delete_child");
++    try addAcl(&t, "write", "everyone allow write");
++    try addAcl(&t, "append", "everyone allow append");
++
++    try expectFile(try t.checkProtected("add/config.ghostty", otherUid()));
++    const allows = "an access control list allows changes";
++    try expectRejected(try t.checkProtected("delete/config.ghostty", otherUid()), allows);
++    try expectRejected(try t.checkProtected("write", otherUid()), allows);
++    try expectRejected(try t.checkProtected("append", otherUid()), allows);
++
++    // The rule for the system file stays strict.
++    try expectRejected(try t.check("add/config.ghostty"), allows);
++}
++
++test "protected file: a path with a NUL byte is rejected" {
++    try expectRejected(
++        try openProtected(std.testing.allocator, "/etc/ghostty\x00/config", otherUid()),
++        "contains a NUL byte",
++    );
++}
++
++test "protected file: the home directory comes from the user database" {
++    const alloc = std.testing.allocator;
++    const home = (try userHome(alloc)) orelse return error.TestExpectedHome;
++    defer alloc.free(home);
++    try std.testing.expect(std.fs.path.isAbsolute(home));
++}
+--- a/src/config/theme.zig
++++ b/src/config/theme.zig
+@@ -4,6 +4,7 @@
+ const global_state = &@import("../global.zig").state;
+ const internal_os = @import("../os/main.zig");
+ const cli = @import("../cli.zig");
++const system_file = @import("system_file.zig");
+ 
+ /// Location of possible themes. The order of this enum matters because it
+ /// defines the priority of theme search (from top to bottom).
+@@ -33,7 +34,7 @@
+ 
+                 break :user internal_os.xdg.config(
+                     arena_alloc,
+-                    .{ .subdir = subdir },
++                    .{ .subdir = subdir, .home = opts.home },
+                 ) catch |err| {
+                     // We need to do some comptime tricks to get the right
+                     // error set since some platforms don't support some
+@@ -85,6 +86,15 @@
+     /// location of the executable alone, because any process running as
+     /// the user can set the environment of the next launch.
+     resources_env: bool = true,
++
++    /// The home directory to find the user's theme directory in, instead
++    /// of XDG_CONFIG_HOME and HOME. See `config-file-protection`.
++    home: ?[]const u8 = null,
++
++    /// Whether a theme file must pass the check that
++    /// `config-file-protection = required` asks for. It is then opened
++    /// through the check.
++    protected: bool = false,
+ };
+ 
+ /// An iterator that returns all possible directories for finding themes in
+@@ -147,6 +157,23 @@
+ } {
+     // Absolute themes are loaded a different path.
+     if (std.fs.path.isAbsolute(theme)) {
++        if (opts.protected) {
++            const file = openProtected(arena_alloc, theme, diags) catch |err| switch (err) {
++                error.OutOfMemory => return error.OutOfMemory,
++                error.Rejected => return null,
++            };
++            if (file) |f| return .{ .path = theme, .file = f };
++            try diags.append(arena_alloc, .{
++                .message = try std.fmt.allocPrintSentinel(
++                    arena_alloc,
++                    "failed to load theme from the path \"{s}\"",
++                    .{theme},
++                    0,
++                ),
++            });
++            return null;
++        }
++
+         const file: std.fs.File = try openAbsolute(
+             arena_alloc,
+             theme,
+@@ -199,6 +226,15 @@
+     const cwd = std.fs.cwd();
+     while (try it.next()) |loc| {
+         const path = try std.fs.path.join(arena_alloc, &.{ loc.dir, theme });
++        if (opts.protected) {
++            const file = openProtected(arena_alloc, path, diags) catch |err| switch (err) {
++                error.OutOfMemory => return error.OutOfMemory,
++                error.Rejected => return null,
++            };
++            if (file) |f| return .{ .path = path, .file = f };
++            continue;
++        }
++
+         if (cwd.openFile(path, .{})) |file| {
+             const stat = file.stat() catch |err| {
+                 try diags.append(arena_alloc, .{
+@@ -269,6 +305,31 @@
+     return null;
+ }
+ 
++/// Open a theme file through the check that `config-file-protection =
++/// required` asks for. Returns null if the file does not exist. A file that
++/// fails the check is reported in `diags`, and error.Rejected is returned.
++fn openProtected(
++    arena_alloc: Allocator,
++    path: []const u8,
++    diags: *cli.DiagnosticList,
++) error{ OutOfMemory, Rejected }!?std.fs.File {
++    return switch (try system_file.openProtected(arena_alloc, path, std.posix.getuid())) {
++        .file => |file| file,
++        .absent => null,
++        .rejected => |reason| {
++            try diags.append(arena_alloc, .{
++                .message = try std.fmt.allocPrintSentinel(
++                    arena_alloc,
++                    "not loading theme {s}: {s}",
++                    .{ path, reason },
++                    0,
++                ),
++            });
++            return error.Rejected;
++        },
++    };
++}
++
+ /// Open the given theme from an absolute path. If there are any errors
+ /// then messages will be appended to the given error list and null is
+ /// returned. If a non-null return value is returned, there are never any

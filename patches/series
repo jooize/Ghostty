@@ -3,3 +3,4 @@
 # ignored.
 env-reset.patch
 system-config.patch
+protected-config.patch

@@ -6,3 +6,7 @@
 system file
 system config
 resources dir from the executable
+
+# protected-config.patch
+protected file
+config-file-protection
