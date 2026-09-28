@@ -1,0 +1,7 @@
+# Zig test-name filters for the tests our patches add, one per line; CI runs
+# `zig build test` with each as -Dtest-filter. Blank lines and lines starting
+# with # are ignored.
+
+# system-config.patch
+system file
+system config

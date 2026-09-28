@@ -132,6 +132,9 @@ jobs:
             exit 1
           fi
 
+      # -Dsystem-config=required (system-config.patch): without a protected
+      # /etc/ghostty/config.ghostty, the app runs on built-in defaults and
+      # ignores user configuration.
       - name: Build GhosttyKit
         working-directory: src
         run: |
@@ -139,6 +142,7 @@ jobs:
             zig build \
             -Doptimize=ReleaseFast \
             -Demit-macos-app=false \
+            -Dsystem-config=required \
             -Dversion-string="${UPSTREAM_TAG#v}"
 
       # Must run outside Nix: upstream notes that Nix breaks xcodebuild.
@@ -199,6 +203,28 @@ jobs:
           path: ${{ runner.temp }}/out
           retention-days: 7
           if-no-files-found: error
+
+      # The Zig tests our patches add, named by patches/test-filters. They run
+      # in one build only, after its upload, so both builds take the same steps
+      # up to the archive. A failure here fails the run.
+      - name: Test the patches
+        if: matrix.run == 'a'
+        working-directory: src
+        run: |
+          filters=()
+          while IFS= read -r f || [[ -n $f ]]; do
+            [[ -z ${f//[[:space:]]/} || $f == \#* ]] && continue
+            filters+=("-Dtest-filter=$f")
+          done < "$GITHUB_WORKSPACE/hardening/patches/test-filters"
+          if [[ ${#filters[@]} -eq 0 ]]; then
+            echo "::error::patches/test-filters: no filters"
+            exit 1
+          fi
+          nix develop -c \
+            zig build test \
+            -Demit-macos-app=false \
+            -Dsystem-config=required \
+            "${filters[@]}"
 
   compare:
     needs: build
