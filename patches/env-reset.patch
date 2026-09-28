@@ -9,9 +9,14 @@ USER, LOGNAME and SHELL from the user database, PATH to the system default
 and TMPDIR from confstr. Core Foundation and ProcessInfo read the
 environment on each call (tested on macOS 26), so no re-exec is needed.
 
+If the user database has no entry for the account, or its home is not an
+absolute path, Ghostty refuses to start: it logs the reason, prints it on
+stderr when launched from a shell, and shows an alert when launched as an
+app, since an app has nowhere to print.
+
 --- a/macos/Sources/App/macOS/main.swift
 +++ b/macos/Sources/App/macOS/main.swift
-@@ -2,6 +2,61 @@
+@@ -2,6 +2,94 @@
  import Cocoa
  import GhosttyKit
  
@@ -29,12 +34,15 @@ environment on each call (tested on macOS 26), so no re-exec is needed.
 +          let name = pw.pointee.pw_name,
 +          let shell = pw.pointee.pw_shell
 +    else {
-+        fputs("ghostty: cannot read the user database; refusing to start\n", stderr)
-+        exit(1)
++        refuseToStart()
++    }
++    let home = String(cString: dir)
++    guard home.hasPrefix("/") else {
++        refuseToStart()
 +    }
 +
 +    var keep: [String: String] = [
-+        "HOME": String(cString: dir),
++        "HOME": home,
 +        "USER": String(cString: name),
 +        "LOGNAME": String(cString: name),
 +        "SHELL": String(cString: shell),
@@ -66,6 +74,36 @@ environment on each call (tested on macOS 26), so no re-exec is needed.
 +    for (key, value) in keep {
 +        setenv(key, value, 1)
 +    }
++}
++
++// Without an account record (or with a home that is not an absolute path)
++// there is no trustworthy home directory, so Ghostty stops rather than keep
++// the inherited environment. Launched as an app it has nowhere to print, so it
++// shows an alert; CFUserNotification works before NSApplication exists.
++// Terminal.app still opens for recovery.
++private func refuseToStart() -> Never {
++    Ghostty.logger.critical(
++        "no usable user database entry for uid \(getuid(), privacy: .public); refusing to start")
++
++    switch Ghostty.launchSource {
++    case .cli, .zig_run:
++        fputs("ghostty: no usable user database entry for this account; refusing to start\n", stderr)
++
++    case .app:
++        var response: CFOptionFlags = 0
++        CFUserNotificationDisplayAlert(
++            0,
++            kCFUserNotificationStopAlertLevel,
++            nil, nil, nil,
++            "Ghostty cannot start" as CFString,
++            ("Ghostty could not read your account from the user database, so it " +
++             "cannot set up a safe environment for your shells. Terminal.app " +
++             "still works. Details are in the system log.") as CFString,
++            "Quit" as CFString,
++            nil, nil,
++            &response)
++    }
++    exit(1)
 +}
 +
 +resetLaunchEnvironment()
