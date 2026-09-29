@@ -1040,7 +1040,7 @@ fails closed.
  
  const Error = error{
      /// The buffer used for output is not large enough to store the value.
-@@ -23,7 +24,37 @@
+@@ -23,7 +24,46 @@
      };
  }
  
@@ -1061,11 +1061,20 @@ fails closed.
 +/// it, never from HOME or CFFIXED_USER_HOME. Null if the database has no
 +/// entry for the user or its home is not an absolute path.
 +pub fn homeFromUserDatabase(buf: []u8) Error!?[]const u8 {
++    // pwd.h directly, as passwd.zig does: std.c.passwd is void on some
++    // targets this file is compiled for (iOS).
++    const c = @cImport({
++        @cInclude("sys/types.h");
++        @cInclude("unistd.h");
++        @cInclude("pwd.h");
++    });
 +    var pw_buf: [4096]u8 = undefined;
-+    var pw: std.c.passwd = undefined;
-+    var entry: ?*std.c.passwd = null;
-+    if (std.c.getpwuid_r(std.c.getuid(), &pw, &pw_buf, pw_buf.len, &entry) != 0) return null;
-+    const dir = std.mem.sliceTo((entry orelse return null).dir orelse return null, 0);
++    var pw: c.struct_passwd = undefined;
++    var entry: ?*c.struct_passwd = null;
++    if (c.getpwuid_r(c.getuid(), &pw, &pw_buf, pw_buf.len, &entry) != 0) return null;
++    const pw_dir = (entry orelse return null).pw_dir;
++    if (pw_dir == null) return null;
++    const dir = std.mem.sliceTo(pw_dir, 0);
 +    if (!std.fs.path.isAbsolute(dir)) return null;
 +    if (buf.len < dir.len) return Error.BufferTooSmall;
 +    @memcpy(buf[0..dir.len], dir);
@@ -1078,7 +1087,7 @@ fails closed.
      // First: if we have a HOME env var, then we use that.
      if (posix.getenv("HOME")) |result| {
          if (buf.len < result.len) return Error.BufferTooSmall;
-@@ -185,3 +216,38 @@
+@@ -185,3 +225,38 @@
      try testing.expect(result != null);
      try testing.expect(result.?.len > 0);
  }
