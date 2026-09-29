@@ -36,9 +36,13 @@ still loads.
 With required, file locations never come from the environment. The default
 files and the user theme directory are found from the home directory in the
 user database, not from HOME, XDG_CONFIG_HOME or CFFIXED_USER_HOME. No
-template file is written, and an input path must be absolute. Once any
-system file is loaded, ~/ in a path also expands from the user database,
-in the system file itself and in every file after it.
+template file is written, and an input path must be absolute.
+
+Once a system file is trusted, Ghostty's one home lookup (homedir.home,
+used for ~/ in paths, working-directory, XDG directories and shell
+integration) answers from the user database for the rest of the process,
+starting with the system file's own paths. This is a one-way switch, so it
+fails closed.
 
 --- a/src/config/Config.zig
 +++ b/src/config/Config.zig
@@ -47,9 +51,9 @@ in the system file itself and in every file after it.
  /// themes and shell integration from the Ghostty executable alone and ignores
  /// `GHOSTTY_RESOURCES_DIR`, since any process running as you can set that
 -/// variable for the next launch.
-+/// variable for the next launch. For the same reason, `~/` in a path then
-+/// means your home directory as the user database records it, whatever
-+/// `HOME` says.
++/// variable for the next launch. For the same reason, Ghostty then takes
++/// your home directory from the user database, whatever `HOME` says: for
++/// `~/` in paths and `working-directory`, and wherever else it needs it.
  @"config-default-files": bool = true,
  
  /// When this is false, configuration from command-line arguments is ignored,
@@ -155,7 +159,20 @@ in the system file itself and in every file after it.
                  return;
              },
              .required => return try self.rejectSystemFile(path, try std.fmt.allocPrint(
-@@ -4104,8 +4166,10 @@
+@@ -4089,6 +4151,12 @@
+     defer file.close();
+     self._system.trusted = true;
+ 
++    // From here on, Ghostty takes the home directory from the user database
++    // for the rest of the process, including for `~/` in this file. Tests
++    // pass trusted_uid and leave this process-wide switch alone, since
++    // other tests set HOME.
++    if (trusted_uid == null) internal_os.useUserDatabaseHome();
++
+     self._system.replay_start = self._replay_steps.items.len;
+     self.loadFsFile(alloc_gpa, &file, path) catch |err| switch (err) {
+         error.OutOfMemory => return error.OutOfMemory,
+@@ -4104,8 +4172,10 @@
      // public fields back so a later value has nothing to change.
      self._system.default_files = self.@"config-default-files";
      self._system.cli_args = self.@"config-cli-args";
@@ -166,12 +183,10 @@ in the system file itself and in every file after it.
  }
  
  /// Fall back to the built-in defaults and say why. A system file that
-@@ -4129,8 +4193,264 @@
-     log.warn("{s}", .{diag.message});
-     try self._diagnostics.append(arena_alloc, diag);
+@@ -4131,6 +4201,212 @@
      try self._replay_steps.append(arena_alloc, .{ .diagnostic = diag });
-+}
-+
+ }
+ 
 +/// Open a configuration file by its absolute path. Under
 +/// `config-file-protection = required`, the file must pass the check in
 +/// system_file.zig and is opened through it. A file that fails is reported
@@ -208,7 +223,8 @@ in the system file itself and in every file after it.
 +/// which any process running as the user can set for the next launch.
 +/// loadFile checks each file, and no template file is written.
 +fn loadProtectedDefaultFiles(self: *Config, alloc: Allocator) !void {
-+    const home = try system_file.userHome(alloc) orelse {
++    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
++    const home = try internal_os.homeFromUserDatabase(&home_buf) orelse {
 +        const arena_alloc = self._arena.?.allocator();
 +        const diag: cli.Diagnostic = .{
 +            .message = "not loading the default configuration files: " ++
@@ -219,7 +235,6 @@ in the system file itself and in every file after it.
 +        try self._replay_steps.append(arena_alloc, .{ .diagnostic = diag });
 +        return;
 +    };
-+    defer alloc.free(home);
 +
 +    const xdg_dir = try internal_os.xdg.config(alloc, .{
 +        .subdir = "ghostty",
@@ -246,54 +261,6 @@ in the system file itself and in every file after it.
 +        const path = try std.fs.path.join(alloc, &.{ dir, name });
 +        defer alloc.free(path);
 +        _ = self.loadOptionalFile(alloc, path);
-+    }
-+}
-+
-+/// Expand a leading `~/` in a path value from `home`, the home directory in
-+/// the user database (see expandPaths). Without one, the path is blanked
-+/// and a diagnostic says why, as Path.expand does when it finds no home.
-+fn expandUserHome(
-+    self: *Config,
-+    value: anytype,
-+    home: ?[]const u8,
-+) Allocator.Error!void {
-+    switch (@TypeOf(value.*)) {
-+        RepeatablePath => for (value.value.items) |*path| {
-+            try self.expandUserHome(path, home);
-+        },
-+
-+        Path => {
-+            const path = switch (value.*) {
-+                .optional, .required => |path| path,
-+            };
-+            if (!std.mem.startsWith(u8, path, "~/")) return;
-+
-+            const arena_alloc = self._arena.?.allocator();
-+            const home_dir = home orelse {
-+                try self._diagnostics.append(arena_alloc, .{
-+                    .message = try std.fmt.allocPrintSentinel(
-+                        arena_alloc,
-+                        "error expanding home directory for path {s}: " ++
-+                            "the user database has no home directory for you",
-+                        .{path},
-+                        0,
-+                    ),
-+                });
-+                value.* = .{ .required = "" };
-+                return;
-+            };
-+            const expanded = try std.mem.concatWithSentinel(
-+                arena_alloc,
-+                u8,
-+                &.{ home_dir, path[1..] },
-+                0,
-+            );
-+            switch (value.*) {
-+                .optional, .required => |*p| p.* = expanded,
-+            }
-+        },
-+
-+        else => @compileError("not a path type"),
 +    }
 +}
 +
@@ -362,13 +329,11 @@ in the system file itself and in every file after it.
 +    if (comptime builtin.os.tag == .macos) if (self.@"macos-icon" == .custom) {
 +        const arena_alloc = self._arena.?.allocator();
 +        const value = self.@"macos-custom-icon" orelse "~/.config/ghostty/Ghostty.icns";
-+        const path: [:0]const u8 = if (std.mem.startsWith(u8, value, "~/"))
-+            if (try system_file.userHome(arena_alloc)) |home|
-+                try std.mem.concatWithSentinel(arena_alloc, u8, &.{ home, value[1..] }, 0)
-+            else
-+                value
-+        else
-+            value;
++        var buf: [std.fs.max_path_bytes]u8 = undefined;
++        const path = try arena_alloc.dupeZ(
++            u8,
++            internal_os.expandHome(value, &buf) catch value,
++        );
 +        const optional = self.@"macos-custom-icon" == null;
 +        if (try self.checkProtectedFile("macos-custom-icon", path, optional)) {
 +            self.@"macos-custom-icon" = path;
@@ -376,8 +341,8 @@ in the system file itself and in every file after it.
 +            self.@"macos-icon" = .official;
 +        }
 +    };
- }
- 
++}
++
 +/// checkProtectedFile for a Path value.
 +fn checkProtectedPath(self: *Config, comptime key: [:0]const u8, path: Path) !bool {
 +    return switch (path) {
@@ -431,12 +396,10 @@ in the system file itself and in every file after it.
  test {
      _ = system_file;
  }
-@@ -4259,6 +4579,141 @@
-             try testing.expect(!cfg._system.cli_args);
-         },
+@@ -4261,6 +4537,122 @@
      }
-+}
-+
+ }
+ 
 +/// Whether `cfg` has a diagnostic for `key` whose message contains `needle`.
 +fn testHasDiagnostic(cfg: *const Config, key: []const u8, needle: []const u8) bool {
 +    for (cfg._diagnostics.items()) |diag| {
@@ -553,37 +516,20 @@ in the system file itself and in every file after it.
 +    try testing.expect(!testHasDiagnostic(&cfg, "background-image", ""));
 +}
 +
-+test "config-file-protection: ~/ comes from the user database once a system file is loaded" {
-+    const testing = std.testing;
-+    const alloc = testing.allocator;
-+    var tmp = testing.tmpDir(.{});
-+    defer tmp.cleanup();
-+    const path = try testSystemFile(&tmp, "custom-shader = ~/ghostty-test.glsl\n", 0o644);
-+    defer alloc.free(path);
-+
-+    var cfg = try Config.default(alloc);
-+    defer cfg.deinit();
-+    try cfg.loadSystemFileAt(alloc, path, std.posix.getuid());
-+
-+    const home = (try system_file.userHome(alloc)).?;
-+    defer alloc.free(home);
-+    const expected = try std.fs.path.join(alloc, &.{ home, "ghostty-test.glsl" });
-+    defer alloc.free(expected);
-+    try testing.expectEqualStrings(expected, cfg.@"custom-shader".value.items[0].required);
- }
- 
  /// Load configurations from the default configuration files. The default
-@@ -4277,6 +4732,9 @@
+ /// configuration file is at `$XDG_CONFIG_HOME/ghostty/config.ghostty`.
+ ///
+@@ -4276,6 +4668,9 @@
+     if (!try self.loadSystemFile(alloc)) {
          log.info("the system configuration turned off user configuration files", .{});
          return;
-     }
++    }
 +    if (self._system.protection == .required) {
 +        return try self.loadProtectedDefaultFiles(alloc);
-+    }
+     }
  
      // Load XDG first
-     const legacy_xdg_path = try file_load.legacyDefaultXdgPath(alloc);
-@@ -4455,6 +4913,7 @@
+@@ -4455,6 +4850,7 @@
          new_config._system.replay_end = new_config._replay_steps.items.len;
          new_config.@"config-default-files" = true;
          new_config.@"config-cli-args" = true;
@@ -591,7 +537,7 @@ in the system file itself and in every file after it.
  
          var it = Replay.iterator(
              self._replay_steps.items[replay_len_start..replay_len_end],
-@@ -4531,7 +4990,8 @@
+@@ -4531,7 +4927,8 @@
              continue;
          }
  
@@ -601,37 +547,7 @@ in the system file itself and in every file after it.
              if (err != error.FileNotFound or !optional) {
                  const diag: cli.Diagnostic = .{
                      .message = try std.fmt.allocPrintSentinel(
-@@ -4653,10 +5113,21 @@
-         .{ .expand = try arena_alloc.dupe(u8, base) },
-     );
- 
-+    // Once a system configuration file is loaded, `~/` means the home
-+    // directory in the user database. HOME comes from the environment,
-+    // which any process running as the user can set for the next launch.
-+    const home: ?[]const u8 = if (self._system.trusted)
-+        try system_file.userHome(arena_alloc)
-+    else
-+        null;
-+
-     // Expand all of our paths
-     inline for (@typeInfo(Config).@"struct".fields) |field| {
-         switch (field.type) {
-             RepeatablePath, Path => {
-+                if (self._system.trusted) {
-+                    try self.expandUserHome(&@field(self, field.name), home);
-+                }
-                 try @field(self, field.name).expand(
-                     arena_alloc,
-                     base,
-@@ -4665,6 +5136,7 @@
-             },
-             ?RepeatablePath, ?Path => {
-                 if (@field(self, field.name)) |*path| {
-+                    if (self._system.trusted) try self.expandUserHome(path, home);
-                     try path.expand(
-                         arena_alloc,
-                         base,
-@@ -4685,15 +5157,26 @@
+@@ -4685,15 +5082,27 @@
          .light => theme.light,
          .dark => theme.dark,
      };
@@ -640,8 +556,9 @@ in the system file itself and in every file after it.
 +    // directory in the user database, and skipped without one.
 +    const arena_alloc = self._arena.?.allocator();
 +    const protected = self._system.protection == .required;
++    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
 +    const home: ?[]const u8 = if (protected)
-+        try system_file.userHome(arena_alloc)
++        try internal_os.homeFromUserDatabase(&home_buf)
 +    else
 +        null;
  
@@ -660,7 +577,7 @@ in the system file itself and in every file after it.
          },
      )) orelse return;
      const path = themefile.path;
-@@ -4800,6 +5283,9 @@
+@@ -4800,6 +5209,9 @@
              self._conditional_set.insert(.theme);
          }
      }
@@ -670,23 +587,10 @@ in the system file itself and in every file after it.
  
      const alloc = self._arena.?.allocator();
  
-@@ -4911,6 +5397,20 @@
+@@ -4911,6 +5323,7 @@
              }
          }
      }
-+
-+    // See expandPaths: once a system configuration file is loaded, `~/`
-+    // comes from the user database, not HOME.
-+    if (self._system.trusted) if (wd.value()) |path| {
-+        if (std.mem.startsWith(u8, path, "~/")) {
-+            if (try system_file.userHome(alloc)) |home| {
-+                wd = .{ .path = try std.mem.concat(alloc, u8, &.{ home, path[1..] }) };
-+            } else {
-+                log.warn("no home directory in the user database for working-directory path={s}", .{path});
-+                wd = .inherit;
-+            }
-+        }
-+    };
 +
      try wd.finalize(alloc);
      self.@"working-directory" = wd;
@@ -784,28 +688,7 @@ in the system file itself and in every file after it.
      };
      defer walk.deinit();
  
-@@ -69,6 +139,20 @@
-     };
- }
- 
-+/// The home directory of the running user from the user database, never
-+/// from HOME, which any process running as the user can set for the next
-+/// launch. Null if the database has no entry for the user or its home is
-+/// not an absolute path. The result is allocated with `alloc`.
-+pub fn userHome(alloc: Allocator) Allocator.Error!?[]const u8 {
-+    var buf: [4096]u8 = undefined;
-+    var pw: std.c.passwd = undefined;
-+    var entry: ?*std.c.passwd = null;
-+    if (std.c.getpwuid_r(std.c.getuid(), &pw, &buf, buf.len, &entry) != 0) return null;
-+    const home = std.mem.sliceTo((entry orelse return null).dir orelse return null, 0);
-+    if (!std.fs.path.isAbsolute(home)) return null;
-+    return try alloc.dupe(u8, home);
-+}
-+
- /// Symlinks followed before the path counts as a loop, as in most kernels.
- const max_symlinks = 32;
- 
-@@ -76,7 +160,7 @@
+@@ -76,7 +146,7 @@
  
  const Walk = struct {
      arena: std.heap.ArenaAllocator,
@@ -814,7 +697,7 @@ in the system file itself and in every file after it.
  
      /// The directories entered so far, from the root down to the current
      /// one. Each is open and has passed `checkDir`.
-@@ -232,7 +316,7 @@
+@@ -232,7 +302,7 @@
          if (st.mode & posix.S.IWOTH != 0) {
              return self.reject("{s}: writable by others", .{entry_path});
          }
@@ -823,7 +706,7 @@ in the system file itself and in every file after it.
          return .{ .handle = fd };
      }
  
-@@ -253,9 +337,27 @@
+@@ -253,9 +323,27 @@
      }
  
      fn checkOwner(self: *Walk, entry_path: []const u8, st: posix.Stat) Error!void {
@@ -854,7 +737,7 @@ in the system file itself and in every file after it.
      }
  
      fn checkDir(
-@@ -274,10 +376,15 @@
+@@ -274,10 +362,15 @@
                  return self.reject("{s}: writable by others", .{dir_path});
              }
          }
@@ -872,7 +755,7 @@ in the system file itself and in every file after it.
          if (comptime !builtin.os.tag.isDarwin()) return;
  
          const acl = darwin_acl.acl_get_fd_np(fd, darwin_acl.ACL_TYPE_EXTENDED) orelse {
-@@ -297,11 +404,18 @@
+@@ -297,11 +390,18 @@
                  return self.reject("{s}: cannot read its access control list", .{entry_path});
              }
              if (tag != darwin_acl.ACL_EXTENDED_ALLOW) continue;
@@ -894,7 +777,7 @@ in the system file itself and in every file after it.
          }
      }
  
-@@ -311,6 +425,31 @@
+@@ -311,6 +411,31 @@
      }
  };
  
@@ -926,7 +809,7 @@ in the system file itself and in every file after it.
  /// The part of <sys/acl.h> used here; the values are from the macOS SDK.
  const darwin_acl = struct {
      const ACL_TYPE_EXTENDED: c_int = 0x00000100;
-@@ -330,6 +469,10 @@
+@@ -330,6 +455,10 @@
          1 << 13, // ACL_CHANGE_OWNER
      };
  
@@ -937,7 +820,7 @@ in the system file itself and in every file after it.
      extern "c" fn acl_get_fd_np(fd: c_int, ty: c_int) ?*anyopaque;
      extern "c" fn acl_free(obj: *anyopaque) c_int;
      extern "c" fn acl_get_entry(acl: *anyopaque, entry_id: c_int, entry: *?*anyopaque) c_int;
-@@ -376,6 +519,12 @@
+@@ -376,6 +505,12 @@
          defer std.testing.allocator.free(p);
          return try open(std.testing.allocator, p, posix.getuid());
      }
@@ -950,7 +833,7 @@ in the system file itself and in every file after it.
  };
  
  fn expectFile(result: Result) !void {
-@@ -532,3 +681,96 @@
+@@ -532,3 +667,89 @@
      defer alloc.free(result.stderr);
      try std.testing.expectEqual(std.process.Child.Term{ .Exited = 0 }, result.term);
  }
@@ -1039,13 +922,6 @@ in the system file itself and in every file after it.
 +        try openProtected(std.testing.allocator, "/etc/ghostty\x00/config", otherUid()),
 +        "contains a NUL byte",
 +    );
-+}
-+
-+test "protected file: the home directory comes from the user database" {
-+    const alloc = std.testing.allocator;
-+    const home = (try userHome(alloc)) orelse return error.TestExpectedHome;
-+    defer alloc.free(home);
-+    try std.testing.expect(std.fs.path.isAbsolute(home));
 +}
 --- a/src/config/theme.zig
 +++ b/src/config/theme.zig
@@ -1154,3 +1030,109 @@ in the system file itself and in every file after it.
  /// Open the given theme from an absolute path. If there are any errors
  /// then messages will be appended to the given error list and null is
  /// returned. If a non-null return value is returned, there are never any
+--- a/src/os/homedir.zig
++++ b/src/os/homedir.zig
+@@ -3,6 +3,7 @@
+ const passwd = @import("passwd.zig");
+ const posix = std.posix;
+ const objc = @import("objc");
++const env_os = @import("env.zig");
+ 
+ const Error = error{
+     /// The buffer used for output is not large enough to store the value.
+@@ -23,7 +24,37 @@
+     };
+ }
+ 
++/// Set once a trusted system configuration file is loaded (see
++/// `config-default-files`). From then on, home() answers from the user
++/// database only, for the rest of the process: HOME and, on macOS,
++/// CFFIXED_USER_HOME come from the environment, which any process running
++/// as the user can set for the next launch.
++var user_database_only: std.atomic.Value(bool) = .init(false);
++
++/// Make home() answer from the user database from now on. This cannot be
++/// undone, so an error later can only fail closed.
++pub fn useUserDatabase() void {
++    user_database_only.store(true, .release);
++}
++
++/// The home directory of the running user as the user database records
++/// it, never from HOME or CFFIXED_USER_HOME. Null if the database has no
++/// entry for the user or its home is not an absolute path.
++pub fn homeFromUserDatabase(buf: []u8) Error!?[]const u8 {
++    var pw_buf: [4096]u8 = undefined;
++    var pw: std.c.passwd = undefined;
++    var entry: ?*std.c.passwd = null;
++    if (std.c.getpwuid_r(std.c.getuid(), &pw, &pw_buf, pw_buf.len, &entry) != 0) return null;
++    const dir = std.mem.sliceTo((entry orelse return null).dir orelse return null, 0);
++    if (!std.fs.path.isAbsolute(dir)) return null;
++    if (buf.len < dir.len) return Error.BufferTooSmall;
++    @memcpy(buf[0..dir.len], dir);
++    return buf[0..dir.len];
++}
++
+ fn homeUnix(buf: []u8) !?[]const u8 {
++    if (user_database_only.load(.acquire)) return try homeFromUserDatabase(buf);
++
+     // First: if we have a HOME env var, then we use that.
+     if (posix.getenv("HOME")) |result| {
+         if (buf.len < result.len) return Error.BufferTooSmall;
+@@ -185,3 +216,38 @@
+     try testing.expect(result != null);
+     try testing.expect(result.?.len > 0);
+ }
++
++test "protected file: home() uses the user database once asked" {
++    if (comptime builtin.os.tag != .linux and
++        builtin.os.tag != .freebsd and
++        builtin.os.tag != .macos) return error.SkipZigTest;
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    const saved_home = home: {
++        const value = posix.getenv("HOME") orelse break :home null;
++        break :home try alloc.dupeZ(u8, value);
++    };
++    defer env: {
++        user_database_only.store(false, .release);
++        const value = saved_home orelse {
++            _ = env_os.unsetenv("HOME");
++            break :env;
++        };
++        _ = env_os.setenv("HOME", value);
++        alloc.free(value);
++    }
++    const planted = "/nonexistent/ghostty-test-home";
++    _ = env_os.setenv("HOME", planted);
++
++    var buf: [std.fs.max_path_bytes]u8 = undefined;
++    try testing.expectEqualStrings(planted, (try home(&buf)).?);
++
++    var db_buf: [std.fs.max_path_bytes]u8 = undefined;
++    const db = (try homeFromUserDatabase(&db_buf)) orelse return error.TestExpectedHome;
++    try testing.expect(std.fs.path.isAbsolute(db));
++
++    useUserDatabase();
++    try testing.expectEqualStrings(db, (try home(&buf)).?);
++    try testing.expectEqualStrings(db, (try expandHome("~/", &buf))[0..db.len]);
++}
+--- a/src/os/main.zig
++++ b/src/os/main.zig
+@@ -56,6 +56,8 @@
+ pub const FlatpakHostCommand = flatpak.FlatpakHostCommand;
+ pub const home = homedir.home;
+ pub const expandHome = homedir.expandHome;
++pub const homeFromUserDatabase = homedir.homeFromUserDatabase;
++pub const useUserDatabaseHome = homedir.useUserDatabase;
+ pub const ensureLocale = locale.ensureLocale;
+ pub const clickInterval = mouse.clickInterval;
+ pub const open = openpkg.open;
+@@ -70,6 +72,7 @@
+ test {
+     _ = i18n;
+     _ = path;
++    _ = homedir;
+     _ = resourcesdir;
+     _ = uri;
+     _ = shell;
