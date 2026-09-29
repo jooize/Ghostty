@@ -44,7 +44,7 @@ in the system file itself and in every file after it.
 +++ b/src/config/Config.zig
 @@ -2484,7 +2484,9 @@
  /// Once a system file is loaded, Ghostty finds its resources directory for
- /// themes from the location of the Ghostty executable alone and ignores
+ /// themes and shell integration from the Ghostty executable alone and ignores
  /// `GHOSTTY_RESOURCES_DIR`, since any process running as you can set that
 -/// variable for the next launch.
 +/// variable for the next launch. For the same reason, `~/` in a path then
@@ -1066,9 +1066,9 @@ in the system file itself and in every file after it.
                  ) catch |err| {
                      // We need to do some comptime tricks to get the right
                      // error set since some platforms don't support some
-@@ -85,6 +86,15 @@
-     /// location of the executable alone, because any process running as
-     /// the user can set the environment of the next launch.
+@@ -82,6 +83,15 @@
+     /// any process running as the user can set the environment of the next
+     /// launch (see `resources_dir_trusted` in global.zig).
      resources_env: bool = true,
 +
 +    /// The home directory to find the user's theme directory in, instead
@@ -1082,7 +1082,7 @@ in the system file itself and in every file after it.
  };
  
  /// An iterator that returns all possible directories for finding themes in
-@@ -147,6 +157,23 @@
+@@ -144,6 +154,23 @@
  } {
      // Absolute themes are loaded a different path.
      if (std.fs.path.isAbsolute(theme)) {
@@ -1106,7 +1106,7 @@ in the system file itself and in every file after it.
          const file: std.fs.File = try openAbsolute(
              arena_alloc,
              theme,
-@@ -199,6 +226,15 @@
+@@ -196,6 +223,15 @@
      const cwd = std.fs.cwd();
      while (try it.next()) |loc| {
          const path = try std.fs.path.join(arena_alloc, &.{ loc.dir, theme });
@@ -1122,7 +1122,7 @@ in the system file itself and in every file after it.
          if (cwd.openFile(path, .{})) |file| {
              const stat = file.stat() catch |err| {
                  try diags.append(arena_alloc, .{
-@@ -269,6 +305,31 @@
+@@ -266,6 +302,31 @@
      return null;
  }
  

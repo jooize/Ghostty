@@ -5,7 +5,7 @@
 # system-config.patch
 system file
 system config
-resources dir from the executable
+resources dir from the
 
 # protected-config.patch
 protected file
