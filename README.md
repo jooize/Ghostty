@@ -28,5 +28,6 @@ Any mismatch fails the build.
 
 The app is built twice on separate runners and compared file by file. For now the
 comparison is reported in the run summary and does not fail the run. The bundle is signed
-ad hoc (no signing key anywhere), and Sparkle has no update key, so it cannot install an
-update over this build.
+ad hoc (no signing key anywhere) with the hardened runtime. `no-sparkle.patch` removes the
+updater, so the app links only Apple's libraries and library validation stays on; each run
+checks that and starts the signed app once.

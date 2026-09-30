@@ -150,10 +150,8 @@ jobs:
         working-directory: src/macos
         run: xcodebuild -target Ghostty -configuration Release
 
-      # Same version metadata as the upstream release. Unlike upstream, keep
-      # the source's SUEnableAutomaticChecks = false (automatic update checks
-      # off) and leave SUPublicEDKey unset, so Sparkle cannot install an
-      # update over this build.
+      # Same version metadata as the upstream release. There are no Sparkle
+      # keys to set: no-sparkle.patch removes the updater.
       - name: Update Info.plist
         run: |
           plist=src/macos/build/Release/Ghostty.app/Contents/Info.plist
@@ -161,23 +159,38 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $UPSTREAM_BUILD" "$plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${UPSTREAM_TAG#v}" "$plist"
 
-      # Upstream's signing order, with an ad-hoc signature (-s -).
+      # Upstream's signing order, with an ad-hoc signature (-s -) and the
+      # hardened runtime, which ignores DYLD_* variables. An ad-hoc signature
+      # has no Team ID, so library validation admits only Apple's libraries:
+      # the app must link nothing of its own (checked below).
       - name: Sign ad hoc
         working-directory: src/macos
         run: |
           app=build/Release/Ghostty.app
-          sparkle=$app/Contents/Frameworks/Sparkle.framework
-          for target in \
-            "$sparkle/Versions/B/XPCServices/Downloader.xpc" \
-            "$sparkle/Versions/B/XPCServices/Installer.xpc" \
-            "$sparkle/Versions/B/Autoupdate" \
-            "$sparkle/Versions/B/Updater.app" \
-            "$sparkle" \
-            "$app/Contents/PlugIns/DockTilePlugin.plugin"; do
-            /usr/bin/codesign -f -s - -o runtime "$target"
-          done
+          /usr/bin/codesign -f -s - -o runtime "$app/Contents/PlugIns/DockTilePlugin.plugin"
           /usr/bin/codesign -f -s - -o runtime --entitlements Ghostty.entitlements "$app"
           /usr/bin/codesign --verify --deep --strict "$app"
+
+      # Library validation refuses a bundled framework at launch, which no
+      # build step notices. Fail here instead: every library the app links
+      # must be Apple's, and the signed app must start.
+      - name: Check that the app starts
+        working-directory: src/macos
+        run: |
+          app=build/Release/Ghostty.app
+          bin=$app/Contents/MacOS/ghostty
+          own=$(otool -L "$bin" | awk '/^\t/ && $1 !~ /^\/(System\/Library|usr\/lib)\// { print $1 }' | sort -u)
+          if [[ -n $own ]]; then
+            echo "::error::the app links libraries that are not Apple's:"
+            echo "$own"
+            exit 1
+          fi
+          if [[ -e $app/Contents/Frameworks ]]; then
+            echo "::error::the app bundles frameworks:"
+            ls "$app/Contents/Frameworks"
+            exit 1
+          fi
+          "$bin" --version
 
       - name: Write manifest and archive
         working-directory: src/macos/build/Release
