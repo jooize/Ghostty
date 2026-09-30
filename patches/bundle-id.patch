@@ -1,0 +1,87 @@
+Give this build its own bundle identifier: bar.esko.Ghostty
+
+This build is signed differently from the official one, so it must not
+claim com.mitchellh.ghostty. Launch Services and privacy permissions
+(TCC) key on the bundle identifier. With two apps under one identifier
+and different signatures, Launch Services may open either one, and a
+permission recorded for one fails the signature check for the other.
+
+Change the identity macOS sees: the app's PRODUCT_BUNDLE_IDENTIFIER in
+all three configurations, the dock tile plugin's, and the defaults suite
+the plugin reads the custom icon from (the app's own defaults domain).
+
+Ghostty's own namespace stays: build_config.bundle_id still names the
+Application Support and cache folders, the translation domain (the .mo
+files are built under that name) and the Zig log subsystem. Notification,
+pasteboard and type names stay too; they are strings, not identity.
+
+--- a/macos/Ghostty.xcodeproj/project.pbxproj
++++ b/macos/Ghostty.xcodeproj/project.pbxproj
+@@ -765,7 +765,7 @@
+ 				MACOSX_DEPLOYMENT_TARGET = 13.0;
+ 				MARKETING_VERSION = 0.1;
+ 				"OTHER_LDFLAGS[arch=*]" = "-lstdc++";
+-				PRODUCT_BUNDLE_IDENTIFIER = com.mitchellh.ghostty;
++				PRODUCT_BUNDLE_IDENTIFIER = bar.esko.Ghostty;
+ 				PRODUCT_NAME = "$(TARGET_NAME)";
+ 				SWIFT_EMIT_LOC_STRINGS = YES;
+ 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/App/macOS/ghostty-bridging-header.h";
+@@ -859,7 +859,7 @@
+ 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+ 				MACOSX_DEPLOYMENT_TARGET = 13.0;
+ 				MARKETING_VERSION = 0.1;
+-				PRODUCT_BUNDLE_IDENTIFIER = "com.mitchellh.ghostty-dock-tile";
++				PRODUCT_BUNDLE_IDENTIFIER = "bar.esko.Ghostty-dock-tile";
+ 				PRODUCT_NAME = "$(TARGET_NAME)";
+ 				PROVISIONING_PROFILE_SPECIFIER = "";
+ 				SKIP_INSTALL = YES;
+@@ -888,7 +888,7 @@
+ 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+ 				MACOSX_DEPLOYMENT_TARGET = 13.0;
+ 				MARKETING_VERSION = 0.1;
+-				PRODUCT_BUNDLE_IDENTIFIER = "com.mitchellh.ghostty-dock-tile";
++				PRODUCT_BUNDLE_IDENTIFIER = "bar.esko.Ghostty-dock-tile";
+ 				PRODUCT_NAME = "$(TARGET_NAME)";
+ 				PROVISIONING_PROFILE_SPECIFIER = "";
+ 				SKIP_INSTALL = YES;
+@@ -917,7 +917,7 @@
+ 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+ 				MACOSX_DEPLOYMENT_TARGET = 13.0;
+ 				MARKETING_VERSION = 0.1;
+-				PRODUCT_BUNDLE_IDENTIFIER = "com.mitchellh.ghostty-dock-tile";
++				PRODUCT_BUNDLE_IDENTIFIER = "bar.esko.Ghostty-dock-tile";
+ 				PRODUCT_NAME = "$(TARGET_NAME)";
+ 				PROVISIONING_PROFILE_SPECIFIER = "";
+ 				SKIP_INSTALL = YES;
+@@ -1162,7 +1162,7 @@
+ 				MACOSX_DEPLOYMENT_TARGET = 13.0;
+ 				MARKETING_VERSION = 0.1;
+ 				"OTHER_LDFLAGS[arch=*]" = "-lstdc++";
+-				PRODUCT_BUNDLE_IDENTIFIER = com.mitchellh.ghostty.debug;
++				PRODUCT_BUNDLE_IDENTIFIER = bar.esko.Ghostty.debug;
+ 				PRODUCT_NAME = "$(TARGET_NAME)";
+ 				SWIFT_EMIT_LOC_STRINGS = YES;
+ 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/App/macOS/ghostty-bridging-header.h";
+@@ -1217,7 +1217,7 @@
+ 				MACOSX_DEPLOYMENT_TARGET = 13.0;
+ 				MARKETING_VERSION = 0.1;
+ 				"OTHER_LDFLAGS[arch=*]" = "-lstdc++";
+-				PRODUCT_BUNDLE_IDENTIFIER = com.mitchellh.ghostty;
++				PRODUCT_BUNDLE_IDENTIFIER = bar.esko.Ghostty;
+ 				PRODUCT_NAME = "$(TARGET_NAME)";
+ 				SWIFT_EMIT_LOC_STRINGS = YES;
+ 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/App/macOS/ghostty-bridging-header.h";
+--- a/macos/Sources/Features/Custom App Icon/DockTilePlugin.swift
++++ b/macos/Sources/Features/Custom App Icon/DockTilePlugin.swift
+@@ -10,9 +10,9 @@
+     // Separate defaults based on debug vs release builds so we can test icons
+     // without messing up releases.
+     #if DEBUG
+-    private let ghosttyUserDefaults = UserDefaults(suiteName: "com.mitchellh.ghostty.debug")
++    private let ghosttyUserDefaults = UserDefaults(suiteName: "bar.esko.Ghostty.debug")
+     #else
+-    private let ghosttyUserDefaults = UserDefaults(suiteName: "com.mitchellh.ghostty")
++    private let ghosttyUserDefaults = UserDefaults(suiteName: "bar.esko.Ghostty")
+     #endif
+ 
+     private var iconChangeObserver: Any?
