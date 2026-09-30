@@ -27,7 +27,23 @@ Any mismatch fails the build.
 ## Reproducibility
 
 The app is built twice on separate runners and compared file by file. For now the
-comparison is reported in the run summary and does not fail the run. The bundle is signed
-ad hoc (no signing key anywhere) with the hardened runtime. `no-sparkle.patch` removes the
-updater, so the app links only Apple's libraries and library validation stays on; each run
-checks that and starts the signed app once.
+comparison is reported in the run summary and the release notes, and does not fail the
+run. The bundle is signed ad hoc (no signing key anywhere) with the hardened runtime.
+`no-sparkle.patch` removes the updater, so the app links only Apple's libraries and
+library validation stays on; each run checks that and starts the signed app once.
+
+## Releases
+
+A release tag is `v<upstream version>+hardening.<n>`, for example `v1.3.1+hardening.1`:
+the upstream version, then this branch's build of it, counted from 1. The tag must be
+annotated, since its message becomes the release notes, and must name the version pinned
+in `UPSTREAM`, or the build refuses it. Pushing the tag runs the build, attests the
+archive of build a with GitHub's build provenance and publishes it with its manifest and
+`SHA256SUMS`.
+
+The app's bundle identifier is `bar.esko.Ghostty` (`bundle-id.patch`), so it never
+passes for the official build in Launch Services or privacy permissions. The archive is
+signed ad hoc and not notarized; it is meant to be installed by a package manager such as
+Nix, which does not mark downloads for Gatekeeper. Check a download with:
+
+    gh attestation verify Ghostty.app.zip --owner jooize

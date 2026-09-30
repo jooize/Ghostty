@@ -1,11 +1,20 @@
 # Build Ghostty.app from the signed upstream tag pinned in UPSTREAM, with the
 # patches listed in patches/series, twice on separate runners, then compare
-# the two bundles file by file. The comparison reports differences and does
-# not fail the run yet: reproducibility is measured, not enforced.
+# the two bundles file by file. The comparison is reported, and fails the
+# run only when REQUIRE_IDENTICAL is true: reproducibility is measured, not
+# yet enforced.
+#
+# A manual run is a dry run: it builds and compares. Pushing a release tag
+# (v<upstream version>+hardening.<n>, annotated) also attests build a's
+# archive and publishes it as a GitHub release.
 name: build
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      # "+" is a filter metacharacter; the escape matches it literally.
+      - 'v*\+hardening.*'
 
 permissions:
   contents: read
@@ -61,6 +70,18 @@ jobs:
           done < hardening/UPSTREAM
           if [[ $seen -ne 7 ]]; then
             echo "::error::UPSTREAM: expected 7 keys, found $seen"
+            exit 1
+          fi
+
+      # A release tag names the upstream version it builds; one that names
+      # another version is refused before anything is built.
+      - name: Check the release tag
+        if: github.ref_type == 'tag'
+        run: |
+          version=${UPSTREAM_TAG#v}
+          want="^v${version//./\\.}\+hardening\.[1-9][0-9]*$"
+          if [[ ! $GITHUB_REF_NAME =~ $want ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match UPSTREAM_TAG $UPSTREAM_TAG (expected ${UPSTREAM_TAG}+hardening.<n>)"
             exit 1
           fi
 
@@ -173,12 +194,20 @@ jobs:
 
       # Library validation refuses a bundled framework at launch, which no
       # build step notices. Fail here instead: every library the app links
-      # must be Apple's, and the signed app must start.
+      # must be Apple's, and the signed app must start. The bundle
+      # identifier comes from bundle-id.patch.
       - name: Check that the app starts
         working-directory: src/macos
+        env:
+          BUNDLE_ID: bar.esko.Ghostty
         run: |
           app=build/Release/Ghostty.app
           bin=$app/Contents/MacOS/ghostty
+          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
+          if [[ $id != "$BUNDLE_ID" ]]; then
+            echo "::error::bundle identifier is '$id', expected $BUNDLE_ID"
+            exit 1
+          fi
           own=$(otool -L "$bin" | awk '/^\t/ && $1 !~ /^\/(System\/Library|usr\/lib)\// { print $1 }' | sort -u)
           if [[ -n $own ]]; then
             echo "::error::the app links libraries that are not Apple's:"
@@ -197,6 +226,12 @@ jobs:
         run: |
           out="$RUNNER_TEMP/out"
           mkdir -p "$out"
+          # Every mtime becomes this branch's commit time, so the archive
+          # does not carry the time of the build. Signatures do not cover
+          # mtimes.
+          epoch=$(git -C "$GITHUB_WORKSPACE/hardening" log -1 --format=%ct)
+          stamp=$(TZ=UTC date -r "$epoch" +%Y%m%d%H%M.%S)
+          TZ=UTC find Ghostty.app -exec touch -h -t "$stamp" {} +
           # One line per file: sha256 or "link:<target>", two spaces, path.
           find Ghostty.app \( -type f -o -type l \) -print0 | LC_ALL=C sort -z |
             while IFS= read -r -d '' f; do
@@ -206,7 +241,8 @@ jobs:
                 printf '%s  %s\n' "$(shasum -a 256 < "$f" | cut -d' ' -f1)" "$f"
               fi
             done > "$out/manifest.txt"
-          ditto -c -k --keepParent Ghostty.app "$out/Ghostty.app.zip"
+          ditto -c -k --keepParent --norsrc --noextattr --noqtn --noacl \
+            Ghostty.app "$out/Ghostty.app.zip"
           wc -l < "$out/manifest.txt"
 
       - name: Upload
@@ -242,25 +278,31 @@ jobs:
   compare:
     needs: build
     runs-on: ubuntu-24.04
+    env:
+      # true: two builds that differ fail the run, and no release is made.
+      REQUIRE_IDENTICAL: "false"
     steps:
       - name: Download both builds
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: build-*
 
+      # The result goes to the run summary and, as reproducibility.md, into
+      # the release notes.
       - name: Compare manifests
         run: |
           total=$(( $(wc -l < build-a/manifest.txt) ))
           if diff -q build-a/manifest.txt build-b/manifest.txt > /dev/null; then
-            summary="Identical: all $total files match."
+            summary="Reproducible: both builds are identical, all $total files match."
             differing=""
           else
             # diff exits 1 when the inputs differ; that is the expected case here.
             differing=$({ diff <(sort -k2 build-a/manifest.txt) <(sort -k2 build-b/manifest.txt) || true; } |
               sed -n 's/^[<>] [^ ]*  //p' | sort -u)
             count=$(printf '%s\n' "$differing" | grep -c . || true)
-            summary="Not reproducible yet: $count of $total paths differ."
+            summary="Not reproducible yet: $count of $total files differ between the two builds."
           fi
+          mkdir -p out
           {
             echo "## Reproducibility"
             echo
@@ -271,5 +313,84 @@ jobs:
               printf '%s\n' "$differing"
               echo '```'
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          } > out/reproducibility.md
+          cat out/reproducibility.md >> "$GITHUB_STEP_SUMMARY"
           echo "$summary"
+          if [[ -n $differing && $REQUIRE_IDENTICAL == true ]]; then
+            echo "::error::the two builds differ"
+            exit 1
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compare
+          path: out
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [build, compare]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sign the attestation
+      attestations: write  # store it
+    steps:
+      # The tag's message is read from the local repository, so the tag must
+      # be checked out here; nothing pushes, so no credentials stay.
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download build a
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-a
+          path: build-a
+
+      - name: Download the comparison
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: compare
+          path: compare
+
+      # Everything that can fail runs before the attestation and the
+      # release: a protected tag cannot be moved to a fixed workflow.
+      - name: Write the release notes and checksums
+        run: |
+          if [[ $(git cat-file -t "refs/tags/$GITHUB_REF_NAME") != tag ]]; then
+            echo "::error::tag $GITHUB_REF_NAME is not annotated; its message is the release notes"
+            exit 1
+          fi
+          mkdir dist
+          cp build-a/Ghostty.app.zip build-a/manifest.txt dist/
+          (cd dist && shasum -a 256 ./Ghostty.app.zip ./manifest.txt | sed 's| \./| |' > SHA256SUMS)
+          {
+            git tag -l --format='%(contents:subject)' "$GITHUB_REF_NAME"
+            body=$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME")
+            if [[ -n $body ]]; then
+              echo
+              printf '%s\n' "$body"
+            fi
+            echo
+            cat compare/reproducibility.md
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          cat dist/SHA256SUMS
+
+      - name: Attest the archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/Ghostty.app.zip
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "Ghostty $GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/Ghostty.app.zip dist/manifest.txt dist/SHA256SUMS
