@@ -38,12 +38,18 @@ A release tag is `v<upstream version>+hardening.<n>`, for example `v1.3.1+harden
 the upstream version, then this branch's build of it, counted from 1. The tag must be
 annotated, since its message becomes the release notes, and must name the version pinned
 in `UPSTREAM`, or the build refuses it. Pushing the tag runs the build, attests the
-archive of build a with GitHub's build provenance and publishes it with its manifest and
-`SHA256SUMS`.
+archive of build a and its manifest with GitHub's build provenance, and publishes both
+with `SHA256SUMS`.
 
 The app's bundle identifier is `bar.esko.Ghostty` (`bundle-id.patch`), so it never
 passes for the official build in Launch Services or privacy permissions. The archive is
 signed ad hoc and not notarized; it is meant to be installed by a package manager such as
-Nix, which does not mark downloads for Gatekeeper. Check a download with:
+Nix, which does not mark downloads for Gatekeeper. Check a download against the workflow,
+the tag and the commit the tag names:
 
-    gh attestation verify Ghostty.app.zip --owner jooize
+    gh attestation verify Ghostty.app.zip -R jooize/Ghostty \
+      --signer-workflow jooize/Ghostty/.github/workflows/build.yml \
+      --source-ref refs/tags/<tag> --source-digest <commit> \
+      --deny-self-hosted-runners
+
+The same command checks `manifest.txt` for releases after `v1.3.1+hardening.1`.
