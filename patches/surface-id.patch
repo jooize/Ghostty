@@ -1,0 +1,33 @@
+Tell each shell which surface it runs in: GHOSTTY_SURFACE_ID
+
+Every surface (a tab or a split) already has a UUID, and Ghostty saves it
+with the window state, so a restored surface gets the same UUID back.
+The shell never saw it. Exporting it lets the shell find out what was
+running in this surface before a restart, for example to offer to resume
+a session there.
+
+The variable is set when the surface is created, after the base
+configuration is chosen, so a value inherited from a parent surface or
+passed in through AppleScript or an App Intent never takes its place.
+
+diff --git a/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift b/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift
+index 3129acf..453bc19 100644
+--- a/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift	
++++ b/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift	
+@@ -390,7 +390,15 @@ extension Ghostty {
+             ) { [weak self] event in self?.localEventHandler(event) }
+ 
+             // Setup our surface. This will also initialize all the terminal IO.
+-            let surface_cfg = baseConfig ?? SurfaceConfiguration()
++            var surface_cfg = baseConfig ?? SurfaceConfiguration()
++
++            // Tell the shell which surface it runs in. The id is saved and
++            // restored with the window state, so a restored surface sees the
++            // same value. Set after the base configuration is chosen, so a
++            // value inherited from a parent surface or passed in by a script
++            // never takes its place.
++            surface_cfg.environmentVariables["GHOSTTY_SURFACE_ID"] = id.uuidString
++
+             let surface = surface_cfg.withCValue(view: self) { surface_cfg_c in
+                 ghostty_surface_new(app, &surface_cfg_c)
+             }

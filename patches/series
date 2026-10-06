@@ -6,3 +6,4 @@ system-config.patch
 protected-config.patch
 no-sparkle.patch
 bundle-id.patch
+surface-id.patch
