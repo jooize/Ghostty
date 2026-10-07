@@ -1,0 +1,16 @@
+# gitleaks configuration: the git hooks run gitleaks at the repo root, which
+# reads this file. The default rules apply; the allowlist below narrows them.
+[extend]
+useDefault = true
+
+# Patches quote Ghostty's own config-format test strings. `keybind =
+# chain=close_surface` (an upstream test line, shown as diff context) reads
+# as `key = value` with a random-looking value to the generic-api-key rule.
+# Allowed only in patch files, and only when the flagged text is a keybind
+# setting.
+[[allowlists]]
+description = "Ghostty keybind test strings quoted in patches"
+condition = "AND"
+paths = ['''^patches/[^/]+\.patch$''']
+regexTarget = "match"
+regexes = ['''^keybind = ''']
