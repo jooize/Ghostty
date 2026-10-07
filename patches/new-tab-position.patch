@@ -1,0 +1,590 @@
+Let a keybind choose where its new tab goes: new_tab:end, new_tab:current
+
+Where a new tab opens came only from window-new-tab-position, for every
+way of opening one. A key that should open its tab at the end of the
+list while Cmd-T keeps opening next to the current tab could not be
+written. Chaining move_tab after new_tab does not help: move_tab acts on
+the tab that is still selected, which is the old one.
+
+new_tab now takes an optional argument, the same way close_tab does:
+- new_tab, or new_tab:config, places the tab where
+  window-new-tab-position says, as before
+- new_tab:current places it right after the current tab
+- new_tab:end places it at the end of the tab list
+
+The value travels through the apprt action (apprt.action.NewTabPosition)
+and the C API (ghostty_action_new_tab_position_e, union member
+new_tab_position) to the macOS app, which hands TerminalController a
+window-new-tab-position value ("current" or "end"), or nothing for
+config. GTK places the tab the same way. Opening a tab any other way
+(the tab bar's + button, the dock, AppleScript, App Intents) still
+follows the config.
+
+A binding to new_tab now prints as new_tab:config in +list-keybinds and
++show-config, as close_tab prints as close_tab:this. Bare new_tab and
+new_tab:config are one action, so the New Tab menu item still shows the
+key bound to new_tab, and a key bound to new_tab:end never takes its
+place.
+
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 507e21e..762c6c6 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -794,6 +794,13 @@ typedef struct {
+   uintptr_t len;
+ } ghostty_action_open_url_s;
+ 
++// apprt.action.NewTabPosition
++typedef enum {
++  GHOSTTY_ACTION_NEW_TAB_POSITION_CONFIG,
++  GHOSTTY_ACTION_NEW_TAB_POSITION_CURRENT,
++  GHOSTTY_ACTION_NEW_TAB_POSITION_END,
++} ghostty_action_new_tab_position_e;
++
+ // apprt.action.CloseTabMode
+ typedef enum {
+   GHOSTTY_ACTION_CLOSE_TAB_MODE_THIS,
+@@ -954,6 +961,7 @@ typedef union {
+   ghostty_action_reload_config_s reload_config;
+   ghostty_action_config_change_s config_change;
+   ghostty_action_open_url_s open_url;
++  ghostty_action_new_tab_position_e new_tab_position;
+   ghostty_action_close_tab_mode_e close_tab_mode;
+   ghostty_surface_message_childexited_s child_exited;
+   ghostty_action_progress_report_s progress_report;
+diff --git a/macos/Sources/App/macOS/AppDelegate.swift b/macos/Sources/App/macOS/AppDelegate.swift
+index cebe9d9..0922abc 100644
+--- a/macos/Sources/App/macOS/AppDelegate.swift
++++ b/macos/Sources/App/macOS/AppDelegate.swift
+@@ -716,8 +716,9 @@ class AppDelegate: NSObject,
+ 
+         let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
+         let config = configAny as? Ghostty.SurfaceConfiguration
++        let position = notification.userInfo?[Ghostty.Notification.NewTabPositionKey] as? String
+ 
+-        _ = TerminalController.newTab(ghostty, from: window, withBaseConfig: config)
++        _ = TerminalController.newTab(ghostty, from: window, withBaseConfig: config, position: position)
+     }
+ 
+     private func setDockBadge() {
+diff --git a/macos/Sources/Features/Terminal/TerminalController.swift b/macos/Sources/Features/Terminal/TerminalController.swift
+index 56b0b40..a0c3d87 100644
+--- a/macos/Sources/Features/Terminal/TerminalController.swift
++++ b/macos/Sources/Features/Terminal/TerminalController.swift
+@@ -367,10 +367,13 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
+         return c
+     }
+ 
++    /// `position` is a window-new-tab-position value ("current" or "end");
++    /// nil means that config decides.
+     static func newTab(
+         _ ghostty: Ghostty.App,
+         from parent: NSWindow? = nil,
+-        withBaseConfig baseConfig: Ghostty.SurfaceConfiguration? = nil
++        withBaseConfig baseConfig: Ghostty.SurfaceConfiguration? = nil,
++        position: String? = nil
+     ) -> TerminalController? {
+         // Making sure that we're dealing with a TerminalController. If not,
+         // then we just create a new window.
+@@ -415,7 +418,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
+         // If we don't allow tabs then we create a new window instead.
+         if window.tabbingMode != .disallowed {
+             // Add the window to the tab group and show it.
+-            switch ghostty.config.windowNewTabPosition {
++            switch position ?? ghostty.config.windowNewTabPosition {
+             case "end":
+                 // If we already have a tab group and we want the new tab to open at the end,
+                 // then we use the last window in the tab group as the parent.
+@@ -483,7 +486,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
+                     _ = TerminalController.newTab(
+                         ghostty,
+                         from: parent,
+-                        withBaseConfig: baseConfig)
++                        withBaseConfig: baseConfig,
++                        position: position)
+                 }
+             }
+         }
+diff --git a/macos/Sources/Ghostty/Ghostty.App.swift b/macos/Sources/Ghostty/Ghostty.App.swift
+index ce88e7c..4bd932e 100644
+--- a/macos/Sources/Ghostty/Ghostty.App.swift
++++ b/macos/Sources/Ghostty/Ghostty.App.swift
+@@ -492,7 +492,7 @@ extension Ghostty {
+                 newWindow(app, target: target)
+ 
+             case GHOSTTY_ACTION_NEW_TAB:
+-                newTab(app, target: target)
++                newTab(app, target: target, position: action.action.new_tab_position)
+ 
+             case GHOSTTY_ACTION_NEW_SPLIT:
+                 newSplit(app, target: target, direction: action.action.new_split)
+@@ -801,7 +801,10 @@ extension Ghostty {
+             }
+         }
+ 
+-        private static func newTab(_ app: ghostty_app_t, target: ghostty_target_s) {
++        private static func newTab(
++            _ app: ghostty_app_t,
++            target: ghostty_target_s,
++            position: ghostty_action_new_tab_position_e) {
+             switch target.tag {
+             case GHOSTTY_TARGET_APP:
+                 NotificationCenter.default.post(
+@@ -824,12 +827,25 @@ extension Ghostty {
+                     return
+                 }
+ 
++                // The keybind's position, in the values of the
++                // window-new-tab-position config. Absent means that config
++                // decides.
++                var userInfo: [AnyHashable: Any] = [
++                    Notification.NewSurfaceConfigKey: SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_TAB)),
++                ]
++                switch position {
++                case GHOSTTY_ACTION_NEW_TAB_POSITION_CURRENT:
++                    userInfo[Notification.NewTabPositionKey] = "current"
++                case GHOSTTY_ACTION_NEW_TAB_POSITION_END:
++                    userInfo[Notification.NewTabPositionKey] = "end"
++                default:
++                    break
++                }
++
+                 NotificationCenter.default.post(
+                     name: Notification.ghosttyNewTab,
+                     object: surfaceView,
+-                    userInfo: [
+-                        Notification.NewSurfaceConfigKey: SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_TAB)),
+-                    ]
++                    userInfo: userInfo
+                 )
+ 
+             default:
+diff --git a/macos/Sources/Ghostty/GhosttyPackage.swift b/macos/Sources/Ghostty/GhosttyPackage.swift
+index 0321186..4069671 100644
+--- a/macos/Sources/Ghostty/GhosttyPackage.swift
++++ b/macos/Sources/Ghostty/GhosttyPackage.swift
+@@ -382,6 +382,10 @@ extension Ghostty.Notification {
+     /// Used to pass a configuration along when creating a new tab/window/split.
+     static let NewSurfaceConfigKey = "com.mitchellh.ghostty.newSurfaceConfig"
+ 
++    /// Where a new tab goes, as a window-new-tab-position value ("current" or
++    /// "end"). Absent means that config decides.
++    static let NewTabPositionKey = "com.mitchellh.ghostty.newTabPosition"
++
+     /// Posted when a new split is requested. The sending object will be the surface that had focus. The
+     /// userdata has one key "direction" with the direction to split to.
+     static let ghosttyNewSplit = Notification.Name("com.mitchellh.ghostty.newSplit")
+diff --git a/src/Surface.zig b/src/Surface.zig
+index ba44fcc..5ebdc01 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -5608,10 +5608,14 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool
+             v,
+         ),
+ 
+-        .new_tab => return try self.rt_app.performAction(
++        .new_tab => |v| return try self.rt_app.performAction(
+             .{ .surface = self },
+             .new_tab,
+-            {},
++            switch (v) {
++                .config => .config,
++                .current => .current,
++                .end => .end,
++            },
+         ),
+ 
+         .close_tab => |v| return try self.rt_app.performAction(
+diff --git a/src/apprt/action.zig b/src/apprt/action.zig
+index f6865af..0cb276e 100644
+--- a/src/apprt/action.zig
++++ b/src/apprt/action.zig
+@@ -85,8 +85,9 @@ pub const Action = union(Key) {
+ 
+     /// Open a new tab. If the target is a surface it should be opened in
+     /// the same window as the surface. If the target is the app then
+-    /// the tab should be opened in a new window.
+-    new_tab,
++    /// the tab should be opened in a new window. The value says where the
++    /// tab is placed in the window's tab list.
++    new_tab: NewTabPosition,
+ 
+     /// Closes the tab belonging to the currently focused split, or all other
+     /// tabs, depending on the mode.
+@@ -925,6 +926,20 @@ pub const OpenUrl = struct {
+     }
+ };
+ 
++/// sync with ghostty_action_new_tab_position_e in ghostty.h
++pub const NewTabPosition = enum(c_int) {
++    /// Where the window-new-tab-position config says.
++    config,
++    /// Right after the current tab.
++    current,
++    /// At the end of the tab list.
++    end,
++
++    test "ghostty.h NewTabPosition" {
++        try lib.checkGhosttyHEnum(NewTabPosition, "GHOSTTY_ACTION_NEW_TAB_POSITION_");
++    }
++};
++
+ /// sync with ghostty_action_close_tab_mode_e in ghostty.h
+ pub const CloseTabMode = enum(c_int) {
+     /// Close the current tab.
+diff --git a/src/apprt/gtk/class/application.zig b/src/apprt/gtk/class/application.zig
+index 039e853..59eb19f 100644
+--- a/src/apprt/gtk/class/application.zig
++++ b/src/apprt/gtk/class/application.zig
+@@ -702,7 +702,7 @@ pub const Application = extern struct {
+ 
+             .new_split => return Action.newSplit(target, value),
+ 
+-            .new_tab => return Action.newTab(target),
++            .new_tab => return Action.newTab(target, value),
+ 
+             .new_window => try Action.newWindow(
+                 self,
+@@ -1134,7 +1134,7 @@ pub const Application = extern struct {
+         self.syncActionAccelerator("win.toggle-command-palette", .toggle_command_palette);
+         self.syncActionAccelerator("win.close", .{ .close_window = {} });
+         self.syncActionAccelerator("win.new-window", .{ .new_window = {} });
+-        self.syncActionAccelerator("win.new-tab", .{ .new_tab = {} });
++        self.syncActionAccelerator("win.new-tab", .{ .new_tab = .config });
+         self.syncActionAccelerator("win.close-tab::this", .{ .close_tab = .this });
+         self.syncActionAccelerator("tab.close::this", .{ .close_tab = .this });
+         self.syncActionAccelerator("win.split-right", .{ .new_split = .right });
+@@ -2193,7 +2193,7 @@ const Action = struct {
+         }
+     }
+ 
+-    pub fn newTab(target: apprt.Target) bool {
++    pub fn newTab(target: apprt.Target, value: apprt.Action.Value(.new_tab)) bool {
+         switch (target) {
+             .app => {
+                 log.warn("new tab to app is unexpected", .{});
+@@ -2212,7 +2212,7 @@ const Action = struct {
+                     log.warn("surface is not in a window, ignoring new_tab", .{});
+                     return false;
+                 };
+-                window.newTab(core);
++                window.newTab(core, value);
+                 return true;
+             },
+         }
+diff --git a/src/apprt/gtk/class/window.zig b/src/apprt/gtk/class/window.zig
+index c01cad6..1ca8822 100644
+--- a/src/apprt/gtk/class/window.zig
++++ b/src/apprt/gtk/class/window.zig
+@@ -385,10 +385,14 @@ pub const Window = extern struct {
+     }
+ 
+     /// Create a new tab with the given parent. The tab will be inserted
+-    /// at the position dictated by the `window-new-tab-position` config.
+-    /// The new tab will be selected.
+-    pub fn newTab(self: *Self, parent_: ?*CoreSurface) void {
+-        _ = self.newTabPage(parent_, .tab, .none);
++    /// at the given position, or where the `window-new-tab-position`
++    /// config says for `.config`. The new tab will be selected.
++    pub fn newTab(
++        self: *Self,
++        parent_: ?*CoreSurface,
++        placement: apprt.action.NewTabPosition,
++    ) void {
++        _ = self.newTabPage(parent_, .tab, placement, .none);
+     }
+ 
+     pub fn newTabForWindow(
+@@ -405,6 +409,7 @@ pub const Window = extern struct {
+         _ = self.newTabPage(
+             parent_,
+             .window,
++            .config,
+             .{
+                 .command = overrides.command,
+                 .working_directory = overrides.working_directory,
+@@ -417,6 +422,7 @@ pub const Window = extern struct {
+         self: *Self,
+         parent_: ?*CoreSurface,
+         context: apprt.surface.NewSurfaceContext,
++        placement: apprt.action.NewTabPosition,
+         overrides: struct {
+             command: ?configpkg.Command = null,
+             working_directory: ?[:0]const u8 = null,
+@@ -452,7 +458,12 @@ pub const Window = extern struct {
+             // This should never happen.
+             return tab_view.append(tab.as(gtk.Widget));
+         };
+-        const position = switch (config.@"window-new-tab-position") {
++        const where: configpkg.Config.WindowNewTabPosition = switch (placement) {
++            .config => config.@"window-new-tab-position",
++            .current => .current,
++            .end => .end,
++        };
++        const position = switch (where) {
+             .current => current: {
+                 const selected = tab_view.getSelectedPage() orelse
+                     break :current tab_view.getNPages();
+@@ -1301,14 +1312,14 @@ pub const Window = extern struct {
+     }
+ 
+     fn btnNewTab(_: *adw.SplitButton, self: *Self) callconv(.c) void {
+-        self.performBindingAction(.new_tab);
++        self.performBindingAction(.{ .new_tab = .config });
+     }
+ 
+     fn tabOverviewCreateTab(
+         _: *adw.TabOverview,
+         self: *Self,
+     ) callconv(.c) *adw.TabPage {
+-        return self.newTabPage(if (self.getActiveSurface()) |v| v.core() else null, .tab, .none);
++        return self.newTabPage(if (self.getActiveSurface()) |v| v.core() else null, .tab, .config, .none);
+     }
+ 
+     fn tabOverviewOpen(
+@@ -1844,7 +1855,7 @@ pub const Window = extern struct {
+         _: ?*glib.Variant,
+         self: *Window,
+     ) callconv(.c) void {
+-        self.performBindingAction(.new_tab);
++        self.performBindingAction(.{ .new_tab = .config });
+     }
+ 
+     fn actionPromptContextTabTitle(
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index 5c82230..7557c25 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -2229,6 +2229,9 @@ keybind: Keybinds = .{},
+ ///     or at the end if there are no focused tabs.
+ ///
+ ///   * `end` - Insert the new tab at the end of the tab list.
++///
++/// A keybind can choose the position for itself, whatever this is set to:
++/// `new_tab:current` or `new_tab:end`.
+ @"window-new-tab-position": WindowNewTabPosition = .current,
+ 
+ /// Whether to show the tab bar.
+@@ -7315,7 +7318,7 @@ pub const Keybinds = struct {
+             try self.set.put(
+                 alloc,
+                 .{ .key = .{ .unicode = 't' }, .mods = .{ .ctrl = true, .shift = true } },
+-                .{ .new_tab = {} },
++                .{ .new_tab = .config },
+             );
+             try self.set.put(
+                 alloc,
+@@ -7686,7 +7689,7 @@ pub const Keybinds = struct {
+             try self.set.put(
+                 alloc,
+                 .{ .key = .{ .unicode = 't' }, .mods = .{ .super = true } },
+-                .{ .new_tab = {} },
++                .{ .new_tab = .config },
+             );
+             try self.set.put(
+                 alloc,
+@@ -8199,7 +8202,7 @@ pub const Keybinds = struct {
+         const want =
+             \\a = ctrl+a>ctrl+b>n=new_window
+             \\a = ctrl+a>ctrl+b>w=close_window
+-            \\a = ctrl+a>ctrl+c>t=new_tab
++            \\a = ctrl+a>ctrl+c>t=new_tab:config
+             \\a = ctrl+b>ctrl+d>a=previous_tab
+             \\
+         ;
+diff --git a/src/input/Binding.zig b/src/input/Binding.zig
+index 62a4e39..fba31cd 100644
+--- a/src/input/Binding.zig
++++ b/src/input/Binding.zig
+@@ -532,7 +532,26 @@ pub const Action = union(enum) {
+     new_window,
+ 
+     /// Open a new tab.
+-    new_tab,
++    ///
++    /// The optional argument sets where the new tab is placed. Valid
++    /// arguments:
++    ///
++    ///   - `config`
++    ///
++    ///     Where `window-new-tab-position` says. This is the default, so
++    ///     `new_tab` without an argument does the same.
++    ///
++    ///   - `current`
++    ///
++    ///     Right after the current tab.
++    ///
++    ///   - `end`
++    ///
++    ///     At the end of the tab list.
++    ///
++    /// For example, `new_tab:end` always opens the tab at the end, whatever
++    /// `window-new-tab-position` is set to.
++    new_tab: NewTabPosition,
+ 
+     /// Go to the previous tab.
+     previous_tab,
+@@ -1150,6 +1169,14 @@ pub const Action = union(enum) {
+         pub const default: CloseTabMode = .this;
+     };
+ 
++    pub const NewTabPosition = enum {
++        config,
++        current,
++        end,
++
++        pub const default: NewTabPosition = .config;
++    };
++
+     fn parseEnum(comptime T: type, value: []const u8) !T {
+         return std.meta.stringToEnum(T, value) orelse return Error.InvalidFormat;
+     }
+@@ -3338,6 +3365,36 @@ test "parse: action with enum with default" {
+     }
+ }
+ 
++test "parse: new_tab position" {
++    const testing = std.testing;
++
++    // No parameter follows the config
++    {
++        const binding = try parseSingle("a=new_tab");
++        try testing.expect(binding.action == .new_tab);
++        try testing.expectEqual(Action.NewTabPosition.config, binding.action.new_tab);
++    }
++    {
++        const binding = try parseSingle("a=new_tab:current");
++        try testing.expectEqual(Action.NewTabPosition.current, binding.action.new_tab);
++    }
++    {
++        const binding = try parseSingle("a=new_tab:end");
++        try testing.expectEqual(Action.NewTabPosition.end, binding.action.new_tab);
++    }
++
++    // `new_tab:end` is a different action from `new_tab`, so a binding to
++    // it never becomes the shortcut a menu shows for `new_tab`
++    {
++        const bare = try Action.parse("new_tab");
++        const end = try Action.parse("new_tab:end");
++        try testing.expect(bare.hash() != end.hash());
++    }
++
++    try testing.expectError(Error.InvalidFormat, parseSingle("a=new_tab:start"));
++    try testing.expectError(Error.InvalidFormat, parseSingle("a=new_tab:"));
++}
++
+ test "parse: action with int" {
+     const testing = std.testing;
+ 
+@@ -3398,7 +3455,7 @@ test "parse: chain" {
+     {
+         var p = try Parser.init("chain=new_tab");
+         try testing.expectEqual(Parser.Elem{
+-            .chain = .new_tab,
++            .chain = .{ .new_tab = .config },
+         }, try p.next());
+         try testing.expect(try p.next() == null);
+     }
+@@ -4074,7 +4131,7 @@ test "set: overriding a mapping updates reverse" {
+     }
+ 
+     // should be most recent
+-    try s.put(alloc, .{ .key = .{ .unicode = 'a' } }, .{ .new_tab = {} });
++    try s.put(alloc, .{ .key = .{ .unicode = 'a' } }, .{ .new_tab = .config });
+     {
+         const trigger = s.getTrigger(.{ .new_window = {} });
+         try testing.expect(trigger == null);
+@@ -4598,7 +4655,7 @@ test "set: appendChain with no parent returns error" {
+     var s: Set = .{};
+     defer s.deinit(alloc);
+ 
+-    try testing.expectError(error.NoChainParent, s.appendChain(alloc, .{ .new_tab = {} }));
++    try testing.expectError(error.NoChainParent, s.appendChain(alloc, .{ .new_tab = .config }));
+ }
+ 
+ test "set: appendChain after put converts to leaf_chained" {
+@@ -4611,7 +4668,7 @@ test "set: appendChain after put converts to leaf_chained" {
+     try s.put(alloc, .{ .key = .{ .unicode = 'a' } }, .{ .new_window = {} });
+ 
+     // First appendChain converts leaf to leaf_chained and appends the new action
+-    try s.appendChain(alloc, .{ .new_tab = {} });
++    try s.appendChain(alloc, .{ .new_tab = .config });
+ 
+     const entry = s.get(.{ .key = .{ .unicode = 'a' } }).?;
+     try testing.expect(entry.value_ptr.* == .leaf_chained);
+@@ -4635,7 +4692,7 @@ test "set: appendChain after putFlags preserves flags" {
+         .{ .new_window = {} },
+         .{ .consumed = false },
+     );
+-    try s.appendChain(alloc, .{ .new_tab = {} });
++    try s.appendChain(alloc, .{ .new_tab = .config });
+ 
+     const entry = s.get(.{ .key = .{ .unicode = 'a' } }).?;
+     try testing.expect(entry.value_ptr.* == .leaf_chained);
+@@ -4655,7 +4712,7 @@ test "set: appendChain multiple times" {
+     defer s.deinit(alloc);
+ 
+     try s.put(alloc, .{ .key = .{ .unicode = 'a' } }, .{ .new_window = {} });
+-    try s.appendChain(alloc, .{ .new_tab = {} });
++    try s.appendChain(alloc, .{ .new_tab = .config });
+     try s.appendChain(alloc, .{ .close_surface = {} });
+ 
+     const entry = s.get(.{ .key = .{ .unicode = 'a' } }).?;
+@@ -4681,7 +4738,7 @@ test "set: appendChain removes reverse mapping" {
+     try testing.expect(s.getTrigger(.{ .new_window = {} }) != null);
+ 
+     // Chaining should remove the reverse mapping
+-    try s.appendChain(alloc, .{ .new_tab = {} });
++    try s.appendChain(alloc, .{ .new_tab = .config });
+ 
+     // Reverse mapping should be gone since chained actions are not in reverse map
+     try testing.expect(s.getTrigger(.{ .new_window = {} }) == null);
+@@ -4710,7 +4767,7 @@ test "set: appendChain with performable does not affect reverse mapping" {
+     try testing.expect(s.getTrigger(.{ .close_surface = {} }) == null);
+ 
+     // Chaining the performable binding should not crash or affect anything
+-    try s.appendChain(alloc, .{ .new_tab = {} });
++    try s.appendChain(alloc, .{ .new_tab = .config });
+ 
+     // The non-performable new_window binding should still be in reverse map
+     try testing.expect(s.getTrigger(.{ .new_window = {} }) != null);
+@@ -4734,7 +4791,7 @@ test "set: appendChain restores next valid reverse mapping" {
+     }
+ 
+     // Chain an action to 'b', which should restore 'a' in the reverse map
+-    try s.appendChain(alloc, .{ .new_tab = {} });
++    try s.appendChain(alloc, .{ .new_tab = .config });
+ 
+     // Now reverse mapping should point to 'a'
+     {
+@@ -4772,7 +4829,7 @@ test "set: formatEntries leaf_chained" {
+ 
+     const expected =
+         \\keybind = a=new_window
+-        \\keybind = chain=new_tab
++        \\keybind = chain=new_tab:config
+         \\
+     ;
+     try testing.expectEqualStrings(expected, output.written());
+@@ -4808,7 +4865,7 @@ test "set: formatEntries leaf_chained multiple chains" {
+ 
+     const expected =
+         \\keybind = ctrl+a=new_window
+-        \\keybind = chain=new_tab
++        \\keybind = chain=new_tab:config
+         \\keybind = chain=close_surface
+         \\
+     ;
+diff --git a/src/input/command.zig b/src/input/command.zig
+index ac048ee..b36b05d 100644
+--- a/src/input/command.zig
++++ b/src/input/command.zig
+@@ -414,7 +414,7 @@ fn actionCommands(action: Action.Key) []const Command {
+         }},
+ 
+         .new_tab => comptime &.{.{
+-            .action = .new_tab,
++            .action = .{ .new_tab = .config },
+             .title = "New Tab",
+             .description = "Open a new tab.",
+         }},

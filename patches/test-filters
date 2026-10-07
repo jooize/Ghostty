@@ -10,3 +10,12 @@ resources dir from the
 # protected-config.patch
 protected file
 config-file-protection
+
+# new-tab-position.patch
+new_tab
+NewTabPosition
+parse: chain
+set: appendChain
+set: formatEntries leaf_chained
+set: overriding a mapping updates reverse
+formatConfig multiple items nested
