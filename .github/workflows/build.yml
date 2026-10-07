@@ -5,7 +5,7 @@
 # yet enforced.
 #
 # A manual run is a dry run: it builds and compares. Pushing a release tag
-# (v<upstream version>+hardening.<n>, annotated) also attests build a's
+# (v<upstream version>+jooize.<n>, annotated) also attests build a's
 # archive and publishes it as a GitHub release.
 name: build
 
@@ -14,7 +14,7 @@ on:
   push:
     tags:
       # "+" is a filter metacharacter; the escape matches it literally.
-      - 'v*\+hardening.*'
+      - 'v*\+jooize.*'
 
 permissions:
   contents: read
@@ -39,7 +39,7 @@ jobs:
       - name: Check out this branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: hardening
+          path: jooize
           persist-credentials: false
 
       - name: Read pins from UPSTREAM
@@ -67,7 +67,7 @@ jobs:
             fi
             echo "$key=$value" >> "$GITHUB_ENV"
             seen=$((seen + 1))
-          done < hardening/UPSTREAM
+          done < jooize/UPSTREAM
           if [[ $seen -ne 7 ]]; then
             echo "::error::UPSTREAM: expected 7 keys, found $seen"
             exit 1
@@ -79,9 +79,9 @@ jobs:
         if: github.ref_type == 'tag'
         run: |
           version=${UPSTREAM_TAG#v}
-          want="^v${version//./\\.}\+hardening\.[1-9][0-9]*$"
+          want="^v${version//./\\.}\+jooize\.[1-9][0-9]*$"
           if [[ ! $GITHUB_REF_NAME =~ $want ]]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match UPSTREAM_TAG $UPSTREAM_TAG (expected ${UPSTREAM_TAG}+hardening.<n>)"
+            echo "::error::tag $GITHUB_REF_NAME does not match UPSTREAM_TAG $UPSTREAM_TAG (expected ${UPSTREAM_TAG}+jooize.<n>)"
             exit 1
           fi
 
@@ -97,7 +97,7 @@ jobs:
           mkdir -m 700 "$GNUPGHOME"
           # A public-key import needs no agent; --no-autostart keeps it from
           # starting one.
-          gpg --batch --quiet --no-autostart --import "hardening/keys/$UPSTREAM_SIGNER.asc"
+          gpg --batch --quiet --no-autostart --import "jooize/keys/$UPSTREAM_SIGNER.asc"
           if ! git -C src verify-tag --raw "$UPSTREAM_TAG" 2> "$RUNNER_TEMP/verify.txt"; then
             cat "$RUNNER_TEMP/verify.txt"
             echo "::error::tag $UPSTREAM_TAG: signature does not verify"
@@ -128,9 +128,9 @@ jobs:
               exit 1
             fi
             echo "applying $p"
-            git -C src apply --index "$GITHUB_WORKSPACE/hardening/patches/$p"
+            git -C src apply --index "$GITHUB_WORKSPACE/jooize/patches/$p"
             count=$((count + 1))
-          done < hardening/patches/series
+          done < jooize/patches/series
           echo "$count patch(es) applied"
 
       - name: Install Nix
@@ -229,7 +229,7 @@ jobs:
           # Every mtime becomes this branch's commit time, so the archive
           # does not carry the time of the build. Signatures do not cover
           # mtimes.
-          epoch=$(git -C "$GITHUB_WORKSPACE/hardening" log -1 --format=%ct)
+          epoch=$(git -C "$GITHUB_WORKSPACE/jooize" log -1 --format=%ct)
           stamp=$(TZ=UTC date -r "$epoch" +%Y%m%d%H%M.%S)
           TZ=UTC find Ghostty.app -exec touch -h -t "$stamp" {} +
           # One line per file: sha256 or "link:<target>", two spaces, path.
@@ -264,7 +264,7 @@ jobs:
           while IFS= read -r f || [[ -n $f ]]; do
             [[ -z ${f//[[:space:]]/} || $f == \#* ]] && continue
             filters+=("-Dtest-filter=$f")
-          done < "$GITHUB_WORKSPACE/hardening/patches/test-filters"
+          done < "$GITHUB_WORKSPACE/jooize/patches/test-filters"
           if [[ ${#filters[@]} -eq 0 ]]; then
             echo "::error::patches/test-filters: no filters"
             exit 1

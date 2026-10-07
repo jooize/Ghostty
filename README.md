@@ -1,4 +1,4 @@
-# Ghostty, hardened build
+# Ghostty, patched build
 
 This branch builds [Ghostty](https://github.com/ghostty-org/ghostty)'s macOS app from a
 signed upstream release tag, with a small set of patches, in GitHub Actions. It is not the
@@ -34,8 +34,11 @@ library validation stays on; each run checks that and starts the signed app once
 
 ## Releases
 
-A release tag is `v<upstream version>+hardening.<n>`, for example `v1.3.1+hardening.1`:
-the upstream version, then this branch's build of it, counted from 1. The tag must be
+A release tag is `v<upstream version>+jooize.<n>`, for example `v1.3.1+jooize.3`: the
+upstream version, then this branch's build of it, counted from 1 for each upstream version.
+The suffix names who built the release, the way a distribution's does, so it stays true
+whatever the patches are for. Releases before `v1.3.1+jooize.3` were tagged `+hardening.<n>`,
+from this branch's earlier name; the count continues across the rename. The tag must be
 annotated, since its message becomes the release notes, and must name the version pinned
 in `UPSTREAM`, or the build refuses it. Pushing the tag runs the build, attests the
 archive of build a and its manifest with GitHub's build provenance, and publishes both
