@@ -24,11 +24,12 @@ build time; `main` stays an untouched copy of upstream.
 
 Any mismatch fails the build.
 
-## Reproducibility
+## Build
 
-The app is built twice on separate runners and compared file by file. For now the
-comparison is reported in the run summary and the release notes, and does not fail the
-run. The bundle is signed ad hoc (no signing key anywhere) with the hardened runtime.
+The app is built once per run. Reproducibility is not checked yet: the last comparison
+of two builds (October 2026) found 4 of 542 files differing, and a second build
+comes back when that work starts. The archive is still written without build times.
+The bundle is signed ad hoc (no signing key anywhere) with the hardened runtime.
 `no-sparkle.patch` removes the updater, so the app links only Apple's libraries and
 library validation stays on; each run checks that and starts the signed app once.
 
@@ -41,7 +42,7 @@ whatever the patches are for. Releases before `v1.3.1+jooize.3` were tagged `+ha
 from this branch's earlier name; the count continues across the rename. The tag must be
 annotated, since its message becomes the release notes, and must name the version pinned
 in `UPSTREAM`, or the build refuses it. Pushing the tag runs the build, attests the
-archive of build a and its manifest with GitHub's build provenance, and publishes both
+archive and its manifest with GitHub's build provenance, and publishes both
 with `SHA256SUMS`.
 
 The app's bundle identifier is `bar.esko.Ghostty` (`bundle-id.patch`), so it never
