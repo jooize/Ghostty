@@ -50,8 +50,8 @@ signed ad hoc and not notarized; it is meant to be installed by a package manage
 Nix, which does not mark downloads for Gatekeeper. Check a download against the workflow,
 the tag and the commit the tag names:
 
-    gh attestation verify Ghostty.app.zip -R jooize/Ghostty \
-      --signer-workflow jooize/Ghostty/.github/workflows/build.yml \
+    gh attestation verify Ghostty.app.zip -R jooize/ghostty \
+      --signer-workflow jooize/ghostty/.github/workflows/build.yml \
       --source-ref refs/tags/<tag> --source-digest <commit> \
       --deny-self-hosted-runners
 
