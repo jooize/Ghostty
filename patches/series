@@ -8,3 +8,4 @@ no-sparkle.patch
 bundle-id.patch
 surface-id.patch
 new-tab-position.patch
+reflow-cursor.patch

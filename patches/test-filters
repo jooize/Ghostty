@@ -19,3 +19,7 @@ set: appendChain
 set: formatEntries leaf_chained
 set: overriding a mapping updates reverse
 formatConfig multiple items nested
+
+# reflow-cursor.patch
+reflows cursor after
+in steps keeps cursor
